@@ -1,0 +1,14 @@
+# 1️⃣ HWP 파일에서 이미지 추출
+python test_ext.py "target_data/테스트_문서.hwp" --sample 20
+
+# 2️⃣ 특징 JSON 생성
+python test_info.py _tmp_extract_test "target_data/자동등록 사진 모음"
+
+# 3️⃣ 추출 ↔ 원본 매핑
+python test_map.py -j image_features.json -t 0.2
+
+# 4️⃣ 시각 검증용 이미지 정렬
+python test_valid.py image_mapping.txt _tmp_extract_test valid_images
+
+# 🌀 통합(추출+매핑+CSV)
+python hwp_image_mapper.py "target_data/기계설비 성능점검 결과보고서(종합 1).hwp" "target_data/자동등록 사진 모음" --sample 20

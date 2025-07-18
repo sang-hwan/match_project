@@ -1,0 +1,9 @@
+Pillow
+imagehash
+hwp-extract
+pytest
+olefile
+scikit-image
+opencv-python
+numpy
+pywin32
