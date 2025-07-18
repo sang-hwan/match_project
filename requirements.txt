@@ -1,8 +1,8 @@
-Pillow
-imagehash
-hwp-extract
-pytest
 olefile
+Pillow
+hwp-extract
+imagehash
+pytest
 scikit-image
 opencv-python
 numpy
