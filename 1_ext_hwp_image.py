@@ -1,10 +1,10 @@
-# ext_hwp_image.py
+# 1_ext_hwp_image.py
 """
 Extract images from HWP5 (*.hwp) or HWPX (*.hwpx) files.
 
 Usage
 -----
-python ext_hwp_image.py path/to/file.hwp out/dir [-s 200]
+python 1_ext_hwp_image.py path/to/file.hwp out/dir [-s 200]
 """
 from __future__ import annotations
 

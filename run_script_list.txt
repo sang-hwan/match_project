@@ -1,22 +1,26 @@
-# ext_hwp_image
+# 1_ext_hwp_image
 
 ## 전체 이미지 추출
-- python ext_hwp_image.py "target_data\테스트_문서.hwp" ./images_output
+- python 1_ext_hwp_image.py "target_data\테스트_문서.hwp" ./images_output
 ## 최대 50개만 샘플링해서 추출
-- python ext_hwp_image.py "target_data\테스트_문서.hwp" ./sample_images -s 50
+- python 1_ext_hwp_image.py "target_data\테스트_문서.hwp" ./sample_images -s 50
 
-# pre_process_image
+# 2_pre_process_image
 
-- python pre_process_image.py ./images_output ./processed/extracted "target_data/자동등록 사진 모음" ./processed/original --size 512
+- python 2_pre_process_image.py images_output/ processed/extracted/ "target_data/자동등록 사진 모음/1. 냉동기" processed/original/ --orig-root target_data --size 512 --min-pixels 0
 
-# mk_images_info
+# 3_mk_phash_candidates
 
-- python mk_images_info.py ./processed/extracted ./processed/original extract.json origin.json
+- python 3_mk_phash_candidates.py processed/extracted/ processed/original/ candidate_mapping.json --threshold 25
 
-# images_mapper
+# 4_verify_mapping
 
-- python images_mapper.py info_for_map/extract.json info_for_map/origin.json processed/extracted processed/original out_map.json -k 10 -t 10
+- python 4_verify_mapping.py candidate_mapping.json processed/extracted/ processed/original/ final_mapping.json
 
-# mapping_valid
+# 5_check_map_result
 
-- python mapping_valid.py mapping.json images_output "target_data/자동등록 사진 모음" mapping_pairs
+- python 5_check_map_result.py final_mapping.json images_output/ "target_data/자동등록 사진 모음" inspect_pairs/
+
+# 6_replace_stream
+
+- python 6_replace_stream.py --map-json final_mapping.json --src-hwp "테스트_문서.hwp" --dst-hwp "테스트_문서_수정본.hwp"

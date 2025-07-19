@@ -1,3 +1,4 @@
+# 6_replace_stream.py
 """
 HWP OLE 스트림 레벨에서 BinData 스트림을 외부 이미지로 교체하는 스크립트
   • 원본 포맷 및 해상도를 유지(또는 맞춤)

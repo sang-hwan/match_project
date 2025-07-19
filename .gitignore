@@ -3,4 +3,5 @@
 /images_output
 /processed
 /info_for_map
-out_map.json
+/inspect_pairs
+*.json
