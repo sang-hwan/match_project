@@ -96,14 +96,16 @@ def _extract_hwp5(hwp: Path, out_dir: Path, sample: int | None) -> list[Path]:
                     except Exception:
                         pass
 
-                # 4) Ole10Native 내 JPEG 추출
+                # 4) Ole10Native 내 JPEG·PNG 추출
                 if img_data is None:
                     try:
-                        ole = olefile.OleFileIO(BytesIO(raw_data))
-                        sub = ole.openstream("Ole10Native").read()
-                        pos = sub.find(b"\xff\xd8\xff")
-                        if pos != -1:
-                            img_data = sub[pos:]
+                        with olefile.OleFileIO(BytesIO(raw_data)) as ole:
+                            sub = ole.openstream("Ole10Native").read()
+                            for sig in (b'\xff\xd8\xff', b'\x89PNG'):
+                                pos = sub.find(sig)
+                                if pos != -1:
+                                    img_data = sub[pos:]
+                                    break
                     except Exception:
                         pass
 

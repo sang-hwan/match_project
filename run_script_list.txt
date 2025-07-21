@@ -1,13 +1,10 @@
 # 1_ext_hwp_image
 
-## 전체 이미지 추출
 - python 1_ext_hwp_image.py "target_data\기계설비 성능점검 결과보고서(종합 1).hwp" ./images_output
-## 최대 50개만 샘플링해서 추출
-- python 1_ext_hwp_image.py "target_data\테스트_문서.hwp" ./images_output -s 50
 
 # 2_pre_process_image
 
-- python 2_pre_process_image.py images_output/ processed/extracted/ "target_data/자동등록 사진 모음" processed/original/ --orig-root target_data --size 512 --min-pixels 0
+- python 2_pre_process_image.py images_output/ processed/extracted/ "target_data/자동등록 사진 모음" processed/original/ --orig-root target_data --size 512 --min-pixels 0 --colorspace lab --pad-mode replicate --pad-color 0,0,0
 
 # 3_mk_phash_candidates
 

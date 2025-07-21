@@ -1,9 +1,0 @@
-python test_ext.py "target_data/테스트_문서.hwp"
-
-'target_data/테스트_문서.hwp'의 특정 이미지들을 'target_data/자동등록 사진 모음\1. 냉동기\1.jpg', 'target_data/자동등록 사진 모음\1. 냉동기\2.jpg'  해당 경로의 이미지로 교체하는 코드를 작성해주세요.
-
-'044_BinData_BIN002B.bmp'의 원본은 'target_data/자동등록 사진 모음\1. 냉동기\1.jpg'입니다.
-'045_BinData_BIN002C.bmp'의 원본은 'target_data/자동등록 사진 모음\1. 냉동기\2.jpg'입니다.
-'048_BinData_BIN002F.bmp'의 원본은 'target_data/자동등록 사진 모음\1. 냉동기\3.jpg'입니다.
-
-python replace_hwp_images.py "target_data/테스트_문서.hwp" "target_data/테스트_문서_수정본.hwp" -r 44 "target_data/자동등록 사진 모음\1. 냉동기\1.jpg" -r 45 "target_data/자동등록 사진 모음\1. 냉동기\2.jpg" -r 48 "target_data/자동등록 사진 모음\1. 냉동기\3.jpg"
