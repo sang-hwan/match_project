@@ -50,39 +50,57 @@ def main() -> None:
     original_root = Path(args.original_root)
     dst_root = Path(args.out_dir)
 
+    # Prepare sanitized root string for splitting
+    # original_root.as_posix() yields "target_data/자동등록 사진 모음"
+    root_sanit = original_root.as_posix().replace("/", "_").replace("\\", "_")
+
     # Reset output folder (flat)
     shutil.rmtree(dst_root, ignore_errors=True)
     dst_root.mkdir(parents=True, exist_ok=True)
 
     count = 0
     total = len(mapping)
-    for idx, (orig_key, cand_key) in enumerate(mapping.items(), start=1):
-        # Derive raw filenames
-        raw_ex = Path(cand_key).stem    # e.g. '032_BinData_BIN001F.bmp'
-        raw_orig = Path(orig_key).stem.split('_')[-1]  # e.g. '1.jpg'
-        print(f"[{idx}/{total}] Pairing extracted='{raw_ex}' with original='{raw_orig}'")
 
-        # Locate extracted file
-        e_candidates = list(extracted_root.rglob(raw_ex))
+    for idx, (orig_key_flat, cand_key) in enumerate(mapping.items(), start=1):
+        # processed original key is flattened by underscores, e.g.
+        # "target_data_자동등록 사진 모음_1. 냉동기_1.jpg"
+        # and cand_key is the processed extracted filename, e.g. "044_BinData_BIN002B.bmp"
+        raw_ex_name = Path(cand_key).name
+        sanitized_orig = orig_key_flat  # keep full flattened orig_key for naming
+
+        print(f"[{idx}/{total}] Pairing extracted='{raw_ex_name}' with original key='{orig_key_flat}'")
+
+        # -- reconstruct actual raw original path --
+        if not orig_key_flat.startswith(root_sanit + "_"):
+            print(f"[WARN] Cannot parse orig_key (unexpected prefix): {orig_key_flat}")
+            continue
+        # suffix is e.g. "1. 냉동기_1.jpg"
+        suffix = orig_key_flat[len(root_sanit) + 1:]
+        if "_" not in suffix:
+            print(f"[WARN] Cannot split suffix into folder and file: {suffix}")
+            continue
+        # split once at first underscore: folder = "1. 냉동기", filename = "1.jpg"
+        subdir, filename = suffix.split("_", 1)
+        orig_path = original_root / subdir / filename
+
+        if not orig_path.exists():
+            print(f"[WARN] Original not found at: {orig_path}")
+            continue
+
+        # locate the extracted file by exact filename
+        e_candidates = list(extracted_root.rglob(raw_ex_name))
         if not e_candidates:
-            print(f"[WARN] Extracted not found: {raw_ex}")
+            print(f"[WARN] Extracted not found: {raw_ex_name}")
             continue
         e_file = e_candidates[0]
 
-        # Locate original file
-        o_candidates = list(original_root.rglob(raw_orig))
-        if not o_candidates:
-            print(f"[WARN] Original not found: {raw_orig}")
-            continue
-        o_file = o_candidates[0]
+        o_file = orig_path
 
-        # Copy directly into dst_root
-        ex_name = f"{raw_ex}_{raw_orig}_추출{e_file.suffix}"
-        ori_name = f"{raw_ex}_{raw_orig}_원본{o_file.suffix}"
-        out_ex = dst_root / ex_name
-        out_ori = dst_root / ori_name
-        shutil.copy(e_file, out_ex)
-        shutil.copy(o_file, out_ori)
+        # copy with naming that preserves the flattened orig_key
+        ex_name  = f"{raw_ex_name}_{sanitized_orig}_추출{e_file.suffix}"
+        ori_name = f"{raw_ex_name}_{sanitized_orig}_원본{o_file.suffix}"
+        shutil.copy(e_file, dst_root / ex_name)
+        shutil.copy(o_file, dst_root / ori_name)
         print(f"[COPY] {ex_name}, {ori_name}")
         count += 1
 

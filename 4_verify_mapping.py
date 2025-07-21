@@ -44,7 +44,6 @@ def compute_ransac_ratio(kps1, desc1, kps2, desc2) -> float:
     if desc1 is None or desc2 is None:
         return 0.0
     matches = FLANN.knnMatch(desc1, desc2, k=2)
-    # 두 개 이하 이웃 없는 pair는 건너뛰기
     good = []
     for pair in matches:
         if len(pair) < 2:
@@ -98,11 +97,23 @@ def main():
             print(f"[WARN] 일치하는 후보 없음: {orig_rel}")
 
     print(f"[DONE] 매핑 완료: {len(mapping)}/{len(candidates)} items")
+
+    # --- 여기가 추가된 부분: 끝에 한 번만 붙은 ".png" 제거 ---
+    clean_mapping: dict[str, str] = {}
+    for orig_rel, cand_rel in mapping.items():
+        # 끝에 .png가 붙어 있으면 한 번만 제거
+        new_orig = orig_rel[:-4] if orig_rel.lower().endswith(".png") else orig_rel
+        new_cand = cand_rel[:-4]  if cand_rel.lower().endswith(".png")  else cand_rel
+        clean_mapping[new_orig] = new_cand
+
+    # 결과 저장
     out_path = Path(args.out_map)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
+    out_path.write_text(
+        json.dumps(clean_mapping, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
     print(f"[SAVE] 결과 저장됨: {out_path}")
-
 
 if __name__ == '__main__':
     main()

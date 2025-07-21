@@ -1,13 +1,12 @@
-# 1_ext_hwp_image.py
+# 1_ext_hwp_image_debug.py
 """
-Extract images from HWP5 (*.hwp) or HWPX (*.hwpx) files.
+Extract images from HWP5 (*.hwp) or HWPX (*.hwpx) files with controlled debug output.
 
-Usage
------
-python 1_ext_hwp_image.py path/to/file.hwp out/dir [-s 200]
+Usage:
+    python 1_ext_hwp_image_debug.py path/to/file.hwp out/dir [-s SAMPLE]
 """
+
 from __future__ import annotations
-
 import argparse
 import random
 import shutil
@@ -17,103 +16,135 @@ from io import BytesIO
 from pathlib import Path
 
 import olefile
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
-# ──────────────────────────── configurable ─────────────────────────────
+# 스트림 이름에 이 키워드가 들어가면 미리보기용이므로 건너뜀
 PREVIEW_KEYWORDS = ("PrvImage", "preview")
-IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff"}
-# ----------------------------------------------------------------------
 
 
 def _detect_type(hwp: Path) -> str:
-    """Return 'hwpx' if PK‑ZIP signature otherwise 'hwp5'."""
-    with hwp.open("rb") as f:
-        return "hwpx" if f.read(4) == b"PK\x03\x04" else "hwp5"
+    print(f"[DETECT] Reading signature from {hwp}")
+    sig = hwp.open("rb").read(4)
+    kind = "hwpx" if sig == b"PK\x03\x04" else "hwp5"
+    print(f"[DETECT] Detected format: {kind}")
+    return kind
 
 
 def _extract_hwpx(hwp: Path, out_dir: Path, sample: int | None) -> list[Path]:
+    print(f"[HWPPX] Extracting resources from HWPX")
     out: list[Path] = []
     with zipfile.ZipFile(hwp) as zf:
-        names = [
-            n
-            for n in zf.namelist()
+        all_names = [
+            n for n in zf.namelist()
             if n.startswith("Contents/Resources/")
-            and not any(k.lower() in n.lower() for k in PREVIEW_KEYWORDS)
+               and not any(k.lower() in n.lower() for k in PREVIEW_KEYWORDS)
         ]
-        if sample:
-            names = random.sample(names, min(sample, len(names)))
-        for i, name in enumerate(names, 1):
+        print(f"[HWPPX] Found {len(all_names)} candidates")
+        chosen = (random.sample(all_names, sample) if sample else all_names)
+        for idx, name in enumerate(chosen, 1):
             data = zf.read(name)
-            dst = out_dir / f"{i:03d}_{Path(name).name}"
+            dst = out_dir / f"{idx:03d}_{Path(name).name}"
             dst.write_bytes(data)
             out.append(dst)
-            print(f"[EXTRACT] {dst.name}")
+            print(f"[HWPPX] Saved {dst.name} ({len(data)} bytes)")
     return out
 
 
 def _extract_hwp5(hwp: Path, out_dir: Path, sample: int | None) -> list[Path]:
-    """Requires `hwp_extract.HWPExtractor` to be installed/importable."""
-    from hwp_extract import HWPExtractor  # local or PyPI
+    print(f"[HWP5] Extracting streams from HWP5")
+    from hwp_extract import HWPExtractor
+
+    raw = hwp.read_bytes()
+    print(f"[HWP5] File size: {len(raw)} bytes")
+    extractor = HWPExtractor(data=raw)
 
     out: list[Path] = []
-    doc = HWPExtractor(data=hwp.read_bytes())
-    objs = list(doc.extract_files())
-    if sample:
-        objs = random.sample(objs, min(sample, len(objs)))
+    saved = 0
+    for idx, obj in enumerate(extractor.extract_files(), 1):
+        # sample 개수만큼 저장했으면 중단
+        if sample and saved >= sample:
+            break
 
-    for i, obj in enumerate(objs, 1):
-        if any(k.lower() in obj.name.lower() for k in PREVIEW_KEYWORDS):
+        name = getattr(obj, "name", f"stream_{idx}")
+        if any(k.lower() in name.lower() for k in PREVIEW_KEYWORDS):
+            continue  # 미리보기 스트림 건너뜀
+
+        try:
+            raw_data = obj.data
+        except Exception:
+            # 압축 해제 단계에서 에러 나면 그냥 건너뜀
             continue
-        raw = obj.data
-        for wb in (None, -zlib.MAX_WBITS):
-            try:
-                raw = zlib.decompress(raw, wb) if wb is not None else zlib.decompress(raw)
-                break
-            except zlib.error:
-                pass
 
         img_data: bytes | None = None
-        try:
-            Image.open(BytesIO(raw)).verify()
-            img_data = raw
-        except Exception:
-            try:
-                ole = olefile.OleFileIO(BytesIO(raw))
-                sub = ole.openstream("Ole10Native").read()
-                idx = sub.find(b"\xff\xd8\xff")
-                img_data = sub[idx:] if idx != -1 else None
-            except Exception:
-                pass
 
-        if img_data:
-            dst = out_dir / f"{i:03d}_{obj.name.replace('/', '_')}"
-            dst.write_bytes(img_data)
-            out.append(dst)
-            print(f"[EXTRACT] {dst.name}")
+        # 1) magic-bytes 기반 빠른 포맷 감지
+        if raw_data.startswith(b"\x89PNG") or raw_data[:2] == b"BM" or raw_data.startswith(b"\xff\xd8\xff"):
+            img_data = raw_data
+        else:
+            # 2) PIL로 시도
+            try:
+                Image.open(BytesIO(raw_data)).verify()
+                img_data = raw_data
+            except Exception:
+                # 3) zlib 압축 해제 + 확인
+                for wb in (None, -zlib.MAX_WBITS):
+                    try:
+                        candidate = zlib.decompress(raw_data) if wb is None else zlib.decompress(raw_data, wb)
+                        Image.open(BytesIO(candidate)).verify()
+                        img_data = candidate
+                        break
+                    except Exception:
+                        pass
+
+                # 4) Ole10Native 내 JPEG 추출
+                if img_data is None:
+                    try:
+                        ole = olefile.OleFileIO(BytesIO(raw_data))
+                        sub = ole.openstream("Ole10Native").read()
+                        pos = sub.find(b"\xff\xd8\xff")
+                        if pos != -1:
+                            img_data = sub[pos:]
+                    except Exception:
+                        pass
+
+        if not img_data:
+            # 유효 이미지가 아니면 건너뜀
+            continue
+
+        # 저장
+        saved += 1
+        dst = out_dir / f"{saved:03d}_{name.replace('/', '_')}"
+        dst.write_bytes(img_data)
+        out.append(dst)
+        print(f"[HWP5] Saved #{saved}: {dst.name} ({len(img_data)} bytes)")
+
+    print(f"[HWP5] Completed: saved {saved} image(s)")
     return out
 
 
 def extract_images(hwp: Path, out_dir: Path, sample: int | None = None) -> list[Path]:
+    print(f"[START] {hwp} → extract_images → {out_dir} (sample={sample})")
     out_dir.mkdir(parents=True, exist_ok=True)
     kind = _detect_type(hwp)
-    return (
-        _extract_hwpx(hwp, out_dir, sample)
-        if kind == "hwpx"
-        else _extract_hwp5(hwp, out_dir, sample)
-    )
+    if kind == "hwpx":
+        return _extract_hwpx(hwp, out_dir, sample)
+    else:
+        return _extract_hwp5(hwp, out_dir, sample)
 
 
 def main() -> None:
-    pa = argparse.ArgumentParser(description="Extract images from HWP/HWPX")
-    pa.add_argument("hwp", help="*.hwp or *.hwpx file")
-    pa.add_argument("out_dir", help="folder to save images")
-    pa.add_argument("-s", "--sample", type=int, help="limit number of images")
-    args = pa.parse_args()
+    parser = argparse.ArgumentParser(description="Extract images from HWP/HWPX")
+    parser.add_argument("hwp", help="*.hwp or *.hwpx file")
+    parser.add_argument("out_dir", help="directory to save images")
+    parser.add_argument("-s", "--sample", type=int, help="limit number of images")
+    args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
+    print(f"[MAIN] Cleaning output dir: {out_dir}")
     shutil.rmtree(out_dir, ignore_errors=True)
-    paths = extract_images(Path(args.hwp), out_dir, args.sample)
-    print(f"[DONE] extracted {len(paths)} images to {out_dir}")
+    print(f"[MAIN] Processing file: {args.hwp}")
+    saved = extract_images(Path(args.hwp), out_dir, args.sample)
+    print(f"[DONE] Extracted {len(saved)} image(s) to {out_dir}")
 
 
 if __name__ == "__main__":
