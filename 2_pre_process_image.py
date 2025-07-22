@@ -37,10 +37,10 @@ def preprocess(
     dst_base: Path,
     size: int,
     min_pixels: int,
-    colorspace: str = "lab",        # 'lab' | 'hsv' | 'rgb'
+    colorspace: str = "lab",
     save_gray: bool = True,
     save_color: bool = True,
-    pad_mode: str = "replicate",    # 'replicate' | 'constant'
+    pad_mode: str = "replicate",
     pad_color: tuple[int,int,int] = (0,0,0),
 ) -> bool:
     """
@@ -51,7 +51,6 @@ def preprocess(
     - Square padding to (size, size)
     - Save color and/or gray PNG(s)
     """
-    # 처리 옵션 로깅
     print(f"[PREPROCESS] {src.name} -> size={size}, min_pixels={min_pixels}, "
           f"colorspace={colorspace}, save_gray={save_gray}, save_color={save_color}, "
           f"pad_mode={pad_mode}, pad_color={pad_color}")
@@ -63,59 +62,55 @@ def preprocess(
             print(f"[SKIP]    {src.name} ({w}×{h} < {min_pixels})")
             return False
 
-        # Prepare RGB array
         arr_rgb = np.array(img.convert("RGB"))
-
-        # ---------- COLOR SPACE CONVERSION ----------
+        # color space conversion
         if colorspace == "lab":
             arr_cs = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2LAB)
-            gray = arr_cs[..., 0]             # L channel
+            gray = arr_cs[..., 0]
         elif colorspace == "hsv":
             arr_cs = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2HSV)
-            gray = arr_cs[..., 2]             # V channel
-        else:  # 'rgb'
+            gray = arr_cs[..., 2]
+        else:
             arr_cs = arr_rgb
             gray = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2GRAY)
-
-        # Linear normalization of gray channel
         gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-        # ---------- ASPECT‑PRESERVE RESIZE ----------
+        # resize
         ratio = size / max(w, h)
         new_w, new_h = int(w * ratio), int(h * ratio)
         resized_cs = cv2.resize(arr_cs, (new_w, new_h), interpolation=cv2.INTER_AREA)
         resized_gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-        # ---------- SQUARE PADDING ----------
+        # padding
         top = (size - new_h) // 2
         bottom = size - new_h - top
         left = (size - new_w) // 2
         right = size - new_w - left
-        border_type = cv2.BORDER_REPLICATE if pad_mode == "replicate" else cv2.BORDER_CONSTANT
-        pad_value = pad_color if pad_mode == "constant" else None
+        border = cv2.BORDER_REPLICATE if pad_mode == "replicate" else cv2.BORDER_CONSTANT
+        value = pad_color if pad_mode == "constant" else None
+        color_sq = cv2.copyMakeBorder(resized_cs, top, bottom, left, right, border, value=value)
+        gray_sq = cv2.copyMakeBorder(resized_gray, top, bottom, left, right, border, value=value)
 
-        color_sq = cv2.copyMakeBorder(
-            resized_cs, top, bottom, left, right, border_type, value=pad_value
-        )
-        gray_sq = cv2.copyMakeBorder(
-            resized_gray, top, bottom, left, right, border_type, value=pad_value
-        )
-
-        # ---------- SAVE OUTPUTS ----------
-        dst_base.parent.mkdir(parents=True, exist_ok=True)
-        saved_any = False
+        # save outputs
+        saved = False
+        # 컬러 저장
         if save_color:
-            out_color = dst_base.with_suffix(".png")
-            Image.fromarray(color_sq).save(str(out_color), format="PNG")
+            color_dir = dst_base.parent
+            color_dir.mkdir(parents=True, exist_ok=True)
+            out_color = color_dir / f"{dst_base.name}.png"
+            Image.fromarray(color_sq).save(str(out_color), format='PNG')
             print(f"[OK]      COLOR {src.name} -> {out_color.name}")
-            saved_any = True
+            saved = True
+        # 그레이 저장
         if save_gray:
-            out_gray = dst_base.with_name(dst_base.stem + "_g.png")
-            Image.fromarray(gray_sq).save(str(out_gray), format="PNG")
+            gray_dir = dst_base.parent.parent / 'gray'
+            gray_dir.mkdir(parents=True, exist_ok=True)
+            out_gray = gray_dir / f"{dst_base.name}_g.png"
+            Image.fromarray(gray_sq).save(str(out_gray), format='PNG')
             print(f"[OK]      GRAY  {src.name} -> {out_gray.name}")
-            saved_any = True
+            saved = True
 
-        return saved_any
+        return saved
 
     except Exception as e:
         print(f"[FAIL]    {src.name}: {e}")
@@ -124,56 +119,38 @@ def preprocess(
 
 def rename_original(fp: Path, orig_root: Path) -> str:
     """
-    Construct flat filename with full relative path parts from orig_root,
-    joined by underscores, preserving original extension before .png
+    fp 예: target_data/자동등록 사진 모음/1. 냉동기/foo.jpg
+    → 'target_data_자동등록 사진 모음_1. 냉동기_foo_jpg'
     """
-    parts = fp.relative_to(orig_root).parts
-    flat = "_".join(parts[:-1] + (fp.stem,))
-    return f"{orig_root.name}_{flat}{fp.suffix}"
+    parts_dir = fp.relative_to(orig_root).parent.parts
+    stem = fp.stem
+    ext = fp.suffix.lstrip('.')
+    flat = '_'.join(parts_dir + (stem,))
+    return f"{orig_root.name}_{flat}_{ext}"
 
 
 def parse_pad_color(s: str) -> tuple[int,int,int]:
-    parts = [int(x) for x in s.split(",")]
+    parts = [int(x) for x in s.split(',')]
     if len(parts) != 3:
-        raise argparse.ArgumentTypeError("pad-color must be R,G,B")
+        raise argparse.ArgumentTypeError('pad-color must be R,G,B')
     return tuple(parts)
 
 
-def main() -> None:
-    pa = argparse.ArgumentParser(description="Enhanced image preprocessing for mapping")
-    pa.add_argument("extracted_src", help="HWP-extracted images folder")
-    pa.add_argument("dst_extracted", help="Processed extracted images output folder")
-    pa.add_argument("original_src", help="Subfolder under original root to process")
-    pa.add_argument("dst_original", help="Processed original images output folder")
-    pa.add_argument("--orig-root", required=True, help="Original root folder for naming")
-    pa.add_argument("--size", type=int, default=512, help="Max dimension for resize")
-    pa.add_argument("--min-pixels", type=int, default=0, help="Minimum pixel area to process")
-    pa.add_argument(
-        "--colorspace",
-        choices=["lab", "hsv", "rgb"],
-        default="lab",
-        help="Color space for processing (lab: L channel, hsv: V channel, rgb: gray)"
-    )
-    pa.add_argument("--no-gray", action="store_true", help="Do not save gray output")
-    pa.add_argument("--no-color", action="store_true", help="Do not save color output")
-    pa.add_argument(
-        "--pad-mode",
-        choices=["replicate", "constant"],
-        default="replicate",
-        help="Padding mode for square output"
-    )
-    pa.add_argument(
-        "--pad-color",
-        type=parse_pad_color,
-        default=(0, 0, 0),
-        help="Padding color for constant mode, as R,G,B"
-    )
+def main():
+    pa = argparse.ArgumentParser(description='Enhanced image preprocessing for mapping')
+    pa.add_argument('extracted_src')
+    pa.add_argument('dst_extracted')
+    pa.add_argument('original_src')
+    pa.add_argument('dst_original')
+    pa.add_argument('--orig-root', required=True)
+    pa.add_argument('--size', type=int, default=512)
+    pa.add_argument('--min-pixels', type=int, default=0)
+    pa.add_argument('--colorspace', choices=['lab','hsv','rgb'], default='lab')
+    pa.add_argument('--no-gray', action='store_true')
+    pa.add_argument('--no-color', action='store_true')
+    pa.add_argument('--pad-mode', choices=['replicate','constant'], default='replicate')
+    pa.add_argument('--pad-color', type=parse_pad_color, default=(0,0,0))
     args = pa.parse_args()
-
-    # 전체 설정 로깅
-    print(f"[CONFIG] size={args.size}, min_pixels={args.min_pixels}, "
-          f"colorspace={args.colorspace}, no_gray={args.no_gray}, no_color={args.no_color}, "
-          f"pad_mode={args.pad_mode}, pad_color={args.pad_color}")
 
     src_ext = Path(args.extracted_src)
     dst_ext = Path(args.dst_extracted)
@@ -188,32 +165,46 @@ def main() -> None:
     pad_mode = args.pad_mode
     pad_color = args.pad_color
 
-    # Process extracted images
-    print(f"[START] Preprocessing extracted images from {src_ext}")
-    ext_files = [p for p in src_ext.rglob("*") if p.suffix.lower() in IMG_EXTS]
-    print(f"[INFO]  Found {len(ext_files)} extracted images")
-    cnt_ext = 0
-    for idx, fp in enumerate(ext_files, start=1):
-        print(f"[{idx}/{len(ext_files)}] Extracted: {fp.name}")
-        base = dst_ext / fp.with_suffix("")
-        if preprocess(fp, base, size, min_px, colorspace, save_gray, save_color, pad_mode, pad_color):
-            cnt_ext += 1
-    print(f"[DONE]  Extracted processed: {cnt_ext}/{len(ext_files)}")
+    print(f"[CONFIG] size={size}, min_pixels={min_px}, colorspace={colorspace}, "
+          f"save_gray={save_gray}, save_color={save_color}, pad_mode={pad_mode}, pad_color={pad_color}")
 
-    # Process original images
-    print(f"[START] Preprocessing originals in {src_ori} (root: {orig_root})")
-    ori_files = [p for p in src_ori.rglob("*") if p.suffix.lower() in IMG_EXTS]
-    print(f"[INFO]  Found {len(ori_files)} original images")
-    cnt_ori = 0
-    for idx, fp in enumerate(ori_files, start=1):
-        rel = fp.relative_to(orig_root)
-        print(f"[{idx}/{len(ori_files)}] Original: {rel}")
+    # extracted
+    print(f"[START] extracted from {src_ext}")
+    ext_files = [p for p in src_ext.rglob('*') if p.suffix.lower() in IMG_EXTS]
+    for idx, fp in enumerate(ext_files, 1):
+        rel = fp.relative_to(src_ext)
+        stem = rel.stem
+        extn = rel.suffix.lstrip('.')
+        rel_dir = rel.parent
+        # color
+        base_color = dst_ext / 'color' / rel_dir / f"{stem}_{extn}"
+        preprocess(fp, base_color, size, min_px, colorspace,
+                   save_gray=False, save_color=True,
+                   pad_mode=pad_mode, pad_color=pad_color)
+        # gray
+        base_gray = dst_ext / 'gray' / rel_dir / f"{stem}_{extn}"
+        preprocess(fp, base_gray, size, min_px, colorspace,
+                   save_gray=True, save_color=False,
+                   pad_mode=pad_mode, pad_color=pad_color)
+    print(f"[DONE] extracted -> {dst_ext}")
+
+    # original
+    print(f"[START] originals in {src_ori} (root {orig_root})")
+    ori_files = [p for p in src_ori.rglob('*') if p.suffix.lower() in IMG_EXTS]
+    for idx, fp in enumerate(ori_files,1):
         name = rename_original(fp, orig_root)
-        base = dst_ori / Path(name).with_suffix("")
-        if preprocess(fp, base, size, min_px, colorspace, save_gray, save_color, pad_mode, pad_color):
-            cnt_ori += 1
-    print(f"[DONE]  Originals processed: {cnt_ori}/{len(ori_files)} -> {dst_ori}")
+        # color
+        base_c = dst_ori / 'color' / name
+        preprocess(fp, base_c, size, min_px, colorspace,
+                   save_gray=False, save_color=True,
+                   pad_mode=pad_mode, pad_color=pad_color)
+        # gray
+        base_g = dst_ori / 'gray' / name
+        preprocess(fp, base_g, size, min_px, colorspace,
+                   save_gray=True, save_color=False,
+                   pad_mode=pad_mode, pad_color=pad_color)
+    print(f"[DONE] originals -> {dst_ori}")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

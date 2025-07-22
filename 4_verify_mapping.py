@@ -7,10 +7,10 @@ ORB + RANSAC 검증
 Usage
 -----
 python 4_verify_mapping.py \
-  candidates.json \
-  path/to/processed_extracted \
-  path/to/processed_original \
-  out_map.json
+  out_pHash.json \
+  path/to/processed_extracted/gray \
+  path/to/processed_original/gray \
+  final_mapping.json
 """
 
 import argparse
@@ -98,12 +98,12 @@ def main():
 
     print(f"[DONE] 매핑 완료: {len(mapping)}/{len(candidates)} items")
 
-    # --- 여기가 추가된 부분: 끝에 한 번만 붙은 ".png" 제거 ---
+    # --- 키와 값에서 '_g' 접미사 제거 ---
     clean_mapping: dict[str, str] = {}
     for orig_rel, cand_rel in mapping.items():
-        # 끝에 .png가 붙어 있으면 한 번만 제거
-        new_orig = orig_rel[:-4] if orig_rel.lower().endswith(".png") else orig_rel
-        new_cand = cand_rel[:-4]  if cand_rel.lower().endswith(".png")  else cand_rel
+        # '_g'만 제거하고 나머지 파일명/확장자는 유지
+        new_orig = orig_rel.replace('_g.png', '')
+        new_cand = cand_rel.replace('_g.png', '')
         clean_mapping[new_orig] = new_cand
 
     # 결과 저장

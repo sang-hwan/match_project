@@ -8,11 +8,11 @@
 
 # 3_mk_phash_candidates
 
-- python 3_mk_phash_candidates.py processed/extracted/ processed/original/ candidate_mapping.json --threshold 30
+- python 3_mk_phash_candidates.py processed/extracted/gray processed/original/gray out_pHash.json --threshold 10 --top-n 30
 
 # 4_verify_mapping
 
-- python 4_verify_mapping.py candidate_mapping.json processed/extracted/ processed/original/ final_mapping.json
+- python 4_verify_mapping.py out_pHash.json processed/extracted/gray processed/original/gray final_mapping.json
 
 # 5_check_map_result
 

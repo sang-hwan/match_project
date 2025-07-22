@@ -1,16 +1,3 @@
-# 3_mk_phash_candidates.py
-"""
-pHash 후보 추림: 전처리된 추출 이미지와 원본 이미지 중 더 적은 쪽을 기준으로 매핑 후보를 찾아 하나의 JSON 파일로 저장합니다.
-
-Usage
------
-python 3_mk_phash_candidates.py \
-  path/to/extracted_dir \
-  path/to/originals_dir \
-  out.json \
-  [--threshold 10]
-"""
-
 import argparse
 import json
 from pathlib import Path
@@ -18,7 +5,8 @@ from PIL import Image
 import imagehash
 
 SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".gif"}
-
+DEFAULT_THRESH = 6
+DEFAULT_TOPN = 30
 
 def compute_phash(path: Path) -> imagehash.ImageHash:
     """Compute perceptual hash for the given image file."""
@@ -45,10 +33,19 @@ def main():
     pa.add_argument(
         "--threshold",
         type=int,
-        default=10,
-        help="pHash 해밍 거리 임계값 (기본값: 10)"
+        default=DEFAULT_THRESH,
+        help=f"pHash 해밍 거리 임계값 (기본값: {DEFAULT_THRESH})"
+    )
+    pa.add_argument(
+        "--top-n",
+        type=int,
+        default=DEFAULT_TOPN,
+        help=f"후보 최대 개수 (기본값: {DEFAULT_TOPN})"
     )
     args = pa.parse_args()
+
+    threshold = args.threshold
+    top_n = args.top_n
 
     print("[START] pHash 후보 추림 시작")
     extracted_dir = Path(args.extracted_dir)
@@ -66,6 +63,7 @@ def main():
     ori_hashes = {p: compute_phash(p) for p in ori_files}
     print(f"[DONE] 원본 이미지 pHash 계산 완료 ({len(ori_hashes)})")
 
+    # 기준 세트 결정
     if len(ori_hashes) <= len(ext_hashes):
         basis_hashes, compare_hashes = ori_hashes, ext_hashes
         basis_root, compare_root = originals_dir, extracted_dir
@@ -83,20 +81,29 @@ def main():
         rel_basis = basis_path.relative_to(basis_root).as_posix()
         print(f"[{idx}/{total}] 처리 중: {rel_basis}")
 
-        # 거리 분포 출력
+        # 거리 계산 및 정렬
         dists = [
             (cmp_path.relative_to(compare_root).as_posix(), basis_hash - cmp_hash)
             for cmp_path, cmp_hash in compare_hashes.items()
         ]
         dists.sort(key=lambda x: x[1])
-        print(f"  ▶ Top-5 해밍 거리: {dists[:5]}")
+        print(f"  ▶ Top-{min(top_n, len(dists))} 해밍 거리: {dists[:top_n]}")
 
-        candidates = [o for o, d in dists if d <= args.threshold]
-        print(f"  ▶ 임계값({args.threshold}) 이하 후보 수: {len(candidates)}")
+        # 필터링
+        candidates = []
+        for obj_rel, dist in dists:
+            if dist > threshold:
+                break
+            candidates.append(obj_rel)
+            if len(candidates) >= top_n:
+                break
+        print(f"  ▶ 임계값({threshold}) 이하 후보 수 (최대 {top_n}): {len(candidates)}")
 
         mapping[rel_basis] = candidates
+
     print(f"[DONE] 후보 매핑 생성 완료 (총 항목: {len(mapping)})")
 
+    # JSON 저장
     out_path = Path(args.out_json)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, 'w', encoding='utf-8') as f:
