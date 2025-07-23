@@ -24,15 +24,15 @@ def main() -> None:
     )
     pa.add_argument(
         "map_json",
-        help="JSON mapping file produced by 4_verify_mapping.py (key: processed original, value: processed extracted)"
+        help="JSON mapping file produced by 4_verify_mapping.py (key: orig_rel, value: cand_name)"
     )
     pa.add_argument(
         "extracted_dir",
-        help="Directory containing raw HWP/HWPX-extracted images"
+        help="Directory containing raw HWP/HWPX-extracted images (images_output)"
     )
     pa.add_argument(
         "original_root",
-        help="Root directory containing raw original images (may have subfolders)"
+        help="Root directory containing raw original images (target_data/자동등록 사진 모음)"
     )
     pa.add_argument(
         "out_dir",
@@ -50,66 +50,53 @@ def main() -> None:
     original_root = Path(args.original_root)
     dst_root = Path(args.out_dir)
 
-    # Prepare sanitized root string for splitting
-    root_sanit = original_root.as_posix().replace("/", "_").replace("\\", "_")
-
-    # Reset output folder (flat)
+    # Reset output folder
     shutil.rmtree(dst_root, ignore_errors=True)
     dst_root.mkdir(parents=True, exist_ok=True)
 
     count = 0
     total = len(mapping)
 
-    for idx, (orig_key_flat, cand_key) in enumerate(mapping.items(), start=1):
-        # cand_key sample: '044_BinData_BIN002B_bmp'
-        raw_ex_key = Path(cand_key).name
-        # split processed extracted key into base and extension token
-        if "_" not in raw_ex_key:
-            print(f"[WARN] Cannot parse extracted key: {raw_ex_key}")
+    for idx, (orig_key_flat, cand_name) in enumerate(mapping.items(), start=1):
+        print(f"[{idx}/{total}] 처리: orig_key='{orig_key_flat}', cand='{cand_name}'")
+        # Reconstruct raw extracted filename: replace '_bmp.png' -> '.bmp'
+        raw_ex_filename = cand_name.replace('_bmp.png', '.bmp')
+        # Locate extracted file
+        ex_candidates = list(extracted_root.rglob(raw_ex_filename))
+        if not ex_candidates:
+            print(f"[WARN] Extracted not found: {raw_ex_filename}")
             continue
-        ex_base, ex_ext = raw_ex_key.rsplit("_", 1)
-        ex_filename = f"{ex_base}.{ex_ext}"
+        e_file = ex_candidates[0]
 
-        sanitized_orig = orig_key_flat  # e.g. 'target_data_..._23_jpg'
-        print(f"[{idx}/{total}] Pairing extracted='{ex_filename}' with original key='{orig_key_flat}'")
-
-        # Reconstruct actual raw original path
-        if not orig_key_flat.startswith(root_sanit + "_"):
-            print(f"[WARN] Cannot parse orig_key (unexpected prefix): {orig_key_flat}")
+        # Parse orig_key_flat: drop prefix, parse subdir, base, ext
+        root_sanit = original_root.as_posix().replace('/', '_').replace('\\', '_')
+        if not orig_key_flat.startswith(root_sanit + '_'):
+            print(f"[WARN] Unexpected orig_key format: {orig_key_flat}")
             continue
-        suffix = orig_key_flat[len(root_sanit) + 1:]
-        # suffix sample: '1. 냉동기_23_jpg'
-        parts = suffix.rsplit("_", 2)
+        suffix = orig_key_flat[len(root_sanit)+1:]
+        parts = suffix.rsplit('_', 2)
         if len(parts) != 3:
-            print(f"[WARN] Cannot split orig_key into subdir, base, ext: {suffix}")
+            print(f"[WARN] Cannot split orig_key suffix: {suffix}")
             continue
-        subdir, base_o, ext_o = parts
-        orig_filename = f"{base_o}.{ext_o}"
+        subdir, base_o, ext_tok = parts
+        ext_actual = ext_tok.split('.', 1)[0]
+        orig_filename = f"{base_o}.{ext_actual}"
         orig_path = original_root / subdir / orig_filename
-
         if not orig_path.exists():
             print(f"[WARN] Original not found at: {orig_path}")
             continue
 
-        # Locate the extracted file by exact filename
-        e_candidates = list(extracted_root.rglob(ex_filename))
-        if not e_candidates:
-            print(f"[WARN] Extracted not found: {ex_filename}")
-            continue
-        e_file = e_candidates[0]
-        o_file = orig_path
-
-        # Copy with naming: <orig_key_flat>_<raw_ex_key>_추출.<ext> and _원본.<ext>
-        prefix = f"{sanitized_orig}_{raw_ex_key}"
+        # Copy files with clear naming
+        # Changed: use stem of orig_key_flat to drop '.png' from prefix
+        prefix = f"{Path(orig_key_flat).stem}_{Path(raw_ex_filename).stem}"
         ex_name = f"{prefix}_추출{e_file.suffix}"
-        ori_name = f"{prefix}_원본{o_file.suffix}"
+        ori_name = f"{prefix}_원본{orig_path.suffix}"
         shutil.copy(e_file, dst_root / ex_name)
-        shutil.copy(o_file, dst_root / ori_name)
+        shutil.copy(orig_path, dst_root / ori_name)
         print(f"[COPY] {ex_name}, {ori_name}")
         count += 1
 
     print(f"[DONE] Copied {count}/{total} pairs to {dst_root}")
-
 
 if __name__ == "__main__":
     main()

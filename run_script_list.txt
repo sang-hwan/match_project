@@ -8,11 +8,11 @@
 
 # 3_mk_phash_candidates
 
-- python 3_mk_phash_candidates.py processed/extracted/gray processed/original/gray out_pHash.json --threshold 10 --top-n 30
+- python 3_mk_phash_candidates.py processed/extracted/gray processed/original/gray processed/extracted/color  processed/original/color out_candidates.json --threshold 20 --hist-threshold 0.4 --topn-phash 20 --topn-hist 10
 
 # 4_verify_mapping
 
-- python 4_verify_mapping.py out_pHash.json processed/extracted/gray processed/original/gray final_mapping.json
+- python 4_verify_mapping.py out_candidates.json processed/extracted/gray processed/original/gray processed/extracted/color processed/original/color final_mapping.json
 
 # 5_check_map_result
 
@@ -20,4 +20,4 @@
 
 # 6_replace_stream
 
-- python 6_replace_stream.py --map-json final_mapping.json --src-hwp "테스트_문서.hwp" --dst-hwp "테스트_문서_수정본.hwp"
+- python 6_replace_stream.py --map-json final_mapping.json --src-hwp "target_data/기계설비 성능점검 결과보고서(종합 1).hwp" --dst-hwp "target_data/기계설비 성능점검 결과보고서(종합 1)_수정본.hwp"
