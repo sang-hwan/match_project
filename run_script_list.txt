@@ -4,11 +4,15 @@
 
 # 2_pre_process_image
 
-- python 2_pre_process_image.py images_output/ processed/extracted/ "target_data/자동등록 사진 모음" processed/original/ --orig-root target_data --size 512 --min-pixels 0 --colorspace lab --pad-mode replicate --pad-color 0,0,0
+- python 2_pre_process_image.py images_output/ processed/extracted "target_data/자동등록 사진 모음" processed/original --orig-root "target_data/자동등록 사진 모음" --low-size 640 --enable-high --min-pixels 10000 --colorspace lab --pad-mode replicate
 
 # 3_mk_phash_candidates
 
-- python 3_mk_phash_candidates.py processed/extracted/gray processed/original/gray processed/extracted/color  processed/original/color out_candidates.json --threshold 20 --hist-threshold 0.4 --topn-phash 20 --topn-hist 10
+- python 3_mk_phash_candidates.py processed/extracted/low/gray processed/original/low/gray processed/extracted/low/color processed/original/low/color candidates.json --mapping preprocess_mapping.json --phash-threshold 18 --hist-threshold 0.3 --topk 20
+
+# 3_A_search_threshold.py
+
+- python 3_A_search_threshold.py processed/extracted/low/gray processed/original/low/gray processed/extracted/low/color processed/original/low/color --mapping preprocess_mapping.json
 
 # 4_verify_mapping
 

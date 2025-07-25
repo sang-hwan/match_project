@@ -1,210 +1,208 @@
 # 2_pre_process_image.py
 """
-Pre-process two sets of images for mapping:
- 1) HWP에서 추출된 이미지
- 2) 그 이미지의 원본 (선택한 서브폴더만)
-
+Enhanced image preprocessing with detailed logging and sequential numbering
+  • Two resolution tracks: low (resize→square pad) & high (crop→denoise→CLAHE)
+  • Automatic whitespace trim, median denoise, LAB→CLAHE
+  • Save color & gray PNG outputs as 000001.png / 000001_g.png
+  • Record mapping info in preprocess_mapping.json
+  • Detailed print() logs for start, per-file, steps, summary
 Usage
 -----
 python 2_pre_process_image.py \
   path/to/extracted_src \
-  path/to/processed_extracted \
+  path/to/processed/extracted \
   path/to/original_src_subfolder \
-  path/to/processed_original \
+  path/to/processed/original \
   --orig-root path/to/original_root \
-  --size 512 \
-  --min-pixels 0 \
-  [--colorspace {lab,hsv,rgb}] \
-  [--no-gray] [--no-color] \
-  [--pad-mode {replicate,constant}] \
-  [--pad-color R,G,B]
+  [--low-size 640] [--enable-high] \
+  [--min-pixels 0] [--colorspace lab] [--pad-mode replicate] [--pad-color R,G,B]
 """
-
 import sys
-sys.stdout.reconfigure(encoding='utf-8')  # ensure UTF-8 output
+sys.stdout.reconfigure(encoding='utf-8')
 
 import argparse
+import json
 from pathlib import Path
 import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".gif"}
-
+clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
 
 def preprocess(
     src: Path,
-    dst_base: Path,
-    size: int,
+    out_path: Path,
+    size: int | None,
     min_pixels: int,
-    colorspace: str = "lab",
-    save_gray: bool = True,
-    save_color: bool = True,
-    pad_mode: str = "replicate",
-    pad_color: tuple[int,int,int] = (0,0,0),
-) -> bool:
+    colorspace: str,
+    pad_mode: str,
+    pad_color: tuple[int,int,int],
+    mapping: dict,
+    track: str,
+    channel: str,
+) -> str:
     """
-    - EXIF orientation correction
-    - Color conversion to LAB/HSV/RGB & extract L/V/Gray channel
-    - Linear normalization 0-255
-    - Aspect-preserving resize (long side -> size)
-    - Square padding to (size, size)
-    - Save color and/or gray PNG(s)
+    Process src image, save to out_path, record mapping, and return status.
+    Returns: 'ok', 'skip', or 'error'.
     """
-    print(f"[PREPROCESS] {src.name} -> size={size}, min_pixels={min_pixels}, "
-          f"colorspace={colorspace}, save_gray={save_gray}, save_color={save_color}, "
-          f"pad_mode={pad_mode}, pad_color={pad_color}")
     try:
         img = Image.open(src)
         img = ImageOps.exif_transpose(img)
-        w, h = img.size
-        if w * h < min_pixels:
-            print(f"[SKIP]    {src.name} ({w}×{h} < {min_pixels})")
-            return False
-
         arr_rgb = np.array(img.convert("RGB"))
-        # color space conversion
-        if colorspace == "lab":
+        h0, w0 = arr_rgb.shape[:2]
+        if w0 * h0 < min_pixels:
+            print(f"[SKIP] Too small: {src} ({w0}×{h0} px)")
+            return 'skip'
+
+        # 1) Trim whitespace
+        gray0 = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2GRAY)
+        _, thr = cv2.threshold(gray0, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        cnts, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        trimmed = False
+        if cnts:
+            x, y, wc, hc = cv2.boundingRect(max(cnts, key=cv2.contourArea))
+            if wc < w0 or hc < h0:
+                arr_rgb = arr_rgb[y:y+hc, x:x+wc]
+                print(f"[STEP] Trim applied: {src}")
+                trimmed = True
+
+        # 2) Median denoise
+        arr_rgb = cv2.medianBlur(arr_rgb, 3)
+        print(f"[STEP] Median blur applied: {src}")
+
+        # 3) Color space + CLAHE
+        if colorspace == 'lab':
             arr_cs = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2LAB)
-            gray = arr_cs[..., 0]
-        elif colorspace == "hsv":
+            L, A, B = cv2.split(arr_cs)
+            L2 = clahe.apply(L)
+            arr_cs = cv2.merge((L2, A, B))
+            gray = L2
+            print(f"[STEP] CLAHE applied: {src}")
+        elif colorspace == 'hsv':
             arr_cs = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2HSV)
-            gray = arr_cs[..., 2]
+            gray = arr_cs[...,2]
         else:
             arr_cs = arr_rgb
             gray = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2GRAY)
         gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-        # resize
-        ratio = size / max(w, h)
-        new_w, new_h = int(w * ratio), int(h * ratio)
-        resized_cs = cv2.resize(arr_cs, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        resized_gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        # 4) Resize + pad or keep crop
+        if size is not None:
+            h1, w1 = arr_cs.shape[:2]
+            ratio = size / max(w1, h1)
+            nw, nh = int(w1 * ratio), int(h1 * ratio)
+            cs_r = cv2.resize(arr_cs, (nw, nh), interpolation=cv2.INTER_AREA)
+            gray_r = cv2.resize(gray, (nw, nh), interpolation=cv2.INTER_AREA)
+            top = (size - nh) // 2; bottom = size - nh - top
+            left = (size - nw) // 2; right = size - nw - left
+            border = cv2.BORDER_REPLICATE if pad_mode == 'replicate' else cv2.BORDER_CONSTANT
+            val = pad_color if pad_mode == 'constant' else None
+            final = cv2.copyMakeBorder(cs_r if channel=='color' else gray_r, top, bottom, left, right, border, value=val)
+        else:
+            final = arr_cs if channel=='color' else gray
 
-        # padding
-        top = (size - new_h) // 2
-        bottom = size - new_h - top
-        left = (size - new_w) // 2
-        right = size - new_w - left
-        border = cv2.BORDER_REPLICATE if pad_mode == "replicate" else cv2.BORDER_CONSTANT
-        value = pad_color if pad_mode == "constant" else None
-        color_sq = cv2.copyMakeBorder(resized_cs, top, bottom, left, right, border, value=value)
-        gray_sq = cv2.copyMakeBorder(resized_gray, top, bottom, left, right, border, value=value)
-
-        # save outputs
-        saved = False
-        # 컬러 저장
-        if save_color:
-            color_dir = dst_base.parent
-            color_dir.mkdir(parents=True, exist_ok=True)
-            out_color = color_dir / f"{dst_base.name}.png"
-            Image.fromarray(color_sq).save(str(out_color), format='PNG')
-            print(f"[OK]      COLOR {src.name} -> {out_color.name}")
-            saved = True
-        # 그레이 저장
-        if save_gray:
-            gray_dir = dst_base.parent.parent / 'gray'
-            gray_dir.mkdir(parents=True, exist_ok=True)
-            out_gray = gray_dir / f"{dst_base.name}_g.png"
-            Image.fromarray(gray_sq).save(str(out_gray), format='PNG')
-            print(f"[OK]      GRAY  {src.name} -> {out_gray.name}")
-            saved = True
-
-        return saved
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(final).save(str(out_path))
+        mapping[out_path.name] = {
+            "원본_전체_경로": str(src.resolve()),
+            "원본_파일명": src.name,
+            "확장자": src.suffix,
+            "트랙": track,
+            "채널": channel,
+        }
+        return 'ok'
 
     except Exception as e:
-        print(f"[FAIL]    {src.name}: {e}")
-        return False
-
-
-def rename_original(fp: Path, orig_root: Path) -> str:
-    """
-    fp 예: target_data/자동등록 사진 모음/1. 냉동기/foo.jpg
-    → 'target_data_자동등록 사진 모음_1. 냉동기_foo_jpg'
-    """
-    parts_dir = fp.relative_to(orig_root).parent.parts
-    stem = fp.stem
-    ext = fp.suffix.lstrip('.')
-    flat = '_'.join(parts_dir + (stem,))
-    return f"{orig_root.name}_{flat}_{ext}"
+        print(f"[ERROR] Failed to process {src}: {e}")
+        return 'error'
 
 
 def parse_pad_color(s: str) -> tuple[int,int,int]:
-    parts = [int(x) for x in s.split(',')]
-    if len(parts) != 3:
+    p = tuple(map(int, s.split(',')))
+    if len(p) != 3:
         raise argparse.ArgumentTypeError('pad-color must be R,G,B')
-    return tuple(parts)
+    return p
 
 
 def main():
-    pa = argparse.ArgumentParser(description='Enhanced image preprocessing for mapping')
-    pa.add_argument('extracted_src')
-    pa.add_argument('dst_extracted')
-    pa.add_argument('original_src')
-    pa.add_argument('dst_original')
+    pa = argparse.ArgumentParser()
+    pa.add_argument('extracted_src'); pa.add_argument('dst_extracted')
+    pa.add_argument('original_src'); pa.add_argument('dst_original')
     pa.add_argument('--orig-root', required=True)
-    pa.add_argument('--size', type=int, default=512)
+    pa.add_argument('--low-size', type=int, default=640)
+    pa.add_argument('--enable-high', action='store_true')
     pa.add_argument('--min-pixels', type=int, default=0)
     pa.add_argument('--colorspace', choices=['lab','hsv','rgb'], default='lab')
-    pa.add_argument('--no-gray', action='store_true')
-    pa.add_argument('--no-color', action='store_true')
     pa.add_argument('--pad-mode', choices=['replicate','constant'], default='replicate')
     pa.add_argument('--pad-color', type=parse_pad_color, default=(0,0,0))
     args = pa.parse_args()
+
+    mapping = {}
+    counter = 1
+    processed = skipped = failed = 0
 
     src_ext = Path(args.extracted_src)
     dst_ext = Path(args.dst_extracted)
     src_ori = Path(args.original_src)
     dst_ori = Path(args.dst_original)
     orig_root = Path(args.orig_root)
-    size = args.size
-    min_px = args.min_pixels
-    colorspace = args.colorspace
-    save_gray = not args.no_gray
-    save_color = not args.no_color
-    pad_mode = args.pad_mode
-    pad_color = args.pad_color
 
-    print(f"[CONFIG] size={size}, min_pixels={min_px}, colorspace={colorspace}, "
-          f"save_gray={save_gray}, save_color={save_color}, pad_mode={pad_mode}, pad_color={pad_color}")
+    # Extracted images
+    print("[START] Preprocessing extracted images...")
+    for fp in src_ext.rglob('*'):
+        if fp.suffix.lower() not in IMG_EXTS: continue
+        for track, base in [('low', dst_ext/'low'), ('high', dst_ext/'high')] if args.enable_high else [('low', dst_ext/'low')]:
+            for channel in ['color','gray']:
+                suffix = '_g' if channel=='gray' else ''
+                out_name = f"{counter:06d}{suffix}.png"
+                out_path = base/track/channel/out_name if False else base/channel/out_name
+                print(f"[INFO] Processing: {fp} → {out_path}")
+                status = preprocess(fp, out_path,
+                                   args.low_size if track=='low' else None,
+                                   args.min_pixels, args.colorspace,
+                                   args.pad_mode, args.pad_color,
+                                   mapping, track, channel)
+                if status == 'ok':
+                    print(f"[OK] Saved: {out_path}")
+                    processed += 1
+                elif status == 'skip':
+                    skipped += 1
+                else:
+                    failed += 1
+                counter += 1
 
-    # extracted
-    print(f"[START] extracted from {src_ext}")
-    ext_files = [p for p in src_ext.rglob('*') if p.suffix.lower() in IMG_EXTS]
-    for idx, fp in enumerate(ext_files, 1):
-        rel = fp.relative_to(src_ext)
-        stem = rel.stem
-        extn = rel.suffix.lstrip('.')
-        rel_dir = rel.parent
-        # color
-        base_color = dst_ext / 'color' / rel_dir / f"{stem}_{extn}"
-        preprocess(fp, base_color, size, min_px, colorspace,
-                   save_gray=False, save_color=True,
-                   pad_mode=pad_mode, pad_color=pad_color)
-        # gray
-        base_gray = dst_ext / 'gray' / rel_dir / f"{stem}_{extn}"
-        preprocess(fp, base_gray, size, min_px, colorspace,
-                   save_gray=True, save_color=False,
-                   pad_mode=pad_mode, pad_color=pad_color)
-    print(f"[DONE] extracted -> {dst_ext}")
+    # Original images
+    print("[START] Preprocessing original images...")
+    for fp in src_ori.rglob('*'):
+        if fp.suffix.lower() not in IMG_EXTS: continue
+        for track, base in [('low', dst_ori/'low'), ('high', dst_ori/'high')] if args.enable_high else [('low', dst_ori/'low')]:
+            for channel in ['color','gray']:
+                suffix = '_g' if channel=='gray' else ''
+                out_name = f"{counter:06d}{suffix}.png"
+                out_path = base/channel/out_name
+                print(f"[INFO] Processing: {fp} → {out_path}")
+                status = preprocess(fp, out_path,
+                                   args.low_size if track=='low' else None,
+                                   args.min_pixels, args.colorspace,
+                                   args.pad_mode, args.pad_color,
+                                   mapping, track, channel)
+                if status == 'ok':
+                    print(f"[OK] Saved: {out_path}")
+                    processed += 1
+                elif status == 'skip':
+                    skipped += 1
+                else:
+                    failed += 1
+                counter += 1
 
-    # original
-    print(f"[START] originals in {src_ori} (root {orig_root})")
-    ori_files = [p for p in src_ori.rglob('*') if p.suffix.lower() in IMG_EXTS]
-    for idx, fp in enumerate(ori_files,1):
-        name = rename_original(fp, orig_root)
-        # color
-        base_c = dst_ori / 'color' / name
-        preprocess(fp, base_c, size, min_px, colorspace,
-                   save_gray=False, save_color=True,
-                   pad_mode=pad_mode, pad_color=pad_color)
-        # gray
-        base_g = dst_ori / 'gray' / name
-        preprocess(fp, base_g, size, min_px, colorspace,
-                   save_gray=True, save_color=False,
-                   pad_mode=pad_mode, pad_color=pad_color)
-    print(f"[DONE] originals -> {dst_ori}")
+    # Summary
+    print(f"[SUMMARY] Total processed: {processed}, Skipped: {skipped}, Failed: {failed}")
 
+    # Save mapping JSON
+    with open('preprocess_mapping.json', 'w', encoding='utf-8') as f:
+        json.dump(mapping, f, ensure_ascii=False, indent=2)
+    print(f"[MAPPING SAVED] preprocess_mapping.json ({len(mapping)} entries)")
 
 if __name__ == '__main__':
     main()

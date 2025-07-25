@@ -4,3 +4,4 @@ hwp-extract
 imagehash
 opencv-python
 numpy
+matplotlib
