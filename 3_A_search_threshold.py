@@ -1,71 +1,76 @@
 # 3_A_search_threshold.py
 """
-Threshold search script: identity-based distance distributions for pHash and Color Histogram
-• Computes distances between processed extracted vs. processed original images of the same identity
-  - pHash: gray_extracted ↔ gray_original
-  - Hist: color_extracted ↔ color_original
-• Saves CSVs and generates histograms & CDFs to suggest thresholds
-• All results are stored in the 'identity_dist' directory
+Threshold‑search script
+=======================
 
-Usage:
-  python 3_A_search_threshold.py \
-    <gray_extracted_dir> \
-    <gray_original_dir> \
-    <color_extracted_dir> \
-    <color_original_dir> \
-    --mapping preprocess_mapping.json \
-    [--dry_run]
+*   Computes pHash (gray) and Bhattacharyya color‑histogram distances **only**
+    between truthfully corresponding pairs:
+         processed‑extracted  (BinData_BINxxxx)  ←→  processed‑original
+*   Saves distance CSVs and, unless --dry_run, draws histograms / CDFs and
+    prints percentile‑based threshold suggestions.
+
+Pair‑finding logic
+------------------
+1.  Build a reverse index that maps each true‑original basename
+    ('1.jpg', '163.bmp', …) **to** its processed filename
+    ('003384_g.png', …) **per channel** using information in
+    *preprocess_mapping.json*.
+2.  For every extracted row we parse the 4‑digit hexadecimal ID embedded in
+    “BinData_BINxxxx”. That hex → decimal string gives the original basename.
+3.  Lookup the processed‑original via the index; if both processed files
+    exist, we measure the distance.
+
+Usage
+-----
+python 3_A_search_threshold.py \
+    <gray_extracted_dir> <gray_original_dir> \
+    <color_extracted_dir> <color_original_dir> \
+    --mapping preprocess_mapping.json [--dry_run]
 """
+
 import argparse
-import json
+import collections
 import csv
+import json
+import re
 from pathlib import Path
-from PIL import Image
-import imagehash
+
 import cv2
-import numpy as np
+import imagehash
 import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
 
-SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".gif"}
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Compute identity-based distance distributions and suggest thresholds"
-    )
-    parser.add_argument(
-        "gray_extracted_dir",
-        help="Directory of processed extracted gray images"
-    )
-    parser.add_argument(
-        "gray_original_dir",
-        help="Directory of processed original gray images"
-    )
-    parser.add_argument(
-        "color_extracted_dir",
-        help="Directory of processed extracted color images"
-    )
-    parser.add_argument(
-        "color_original_dir",
-        help="Directory of processed original color images"
-    )
-    parser.add_argument(
-        "--mapping", required=True,
-        help="Path to preprocess_mapping.json"
-    )
-    parser.add_argument(
-        "--dry_run", action="store_true",
-        help="Only compute/save distances; skip plotting and suggestions"
-    )
-    return parser.parse_args()
+# --------------------------------------------------------------------------- #
+#  Constants
+# --------------------------------------------------------------------------- #
+SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".bmp",
+                  ".tif", ".tiff", ".gif"}
+ORIG_CANDIDATE_EXTS = [".jpg", ".jpeg", ".png",
+                       ".bmp", ".gif", ".tif", ".tiff"]
+BIN_RE = re.compile(r"BinData_BIN([0-9A-Fa-f]{4})")
 
 
-def load_mapping(path: str) -> dict:
-    """Load JSON mapping from processed filename to metadata."""
-    with open(path, encoding="utf-8") as f:
-        mapping = json.load(f)
-    print(f"[INFO] Loaded mapping from {path}, entries: {len(mapping)}")
-    return mapping
+# --------------------------------------------------------------------------- #
+#  CLI
+# --------------------------------------------------------------------------- #
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Search thresholds for pHash / Hist.")
+    p.add_argument("gray_extracted_dir")
+    p.add_argument("gray_original_dir")
+    p.add_argument("color_extracted_dir")
+    p.add_argument("color_original_dir")
+    p.add_argument("--mapping", required=True)
+    p.add_argument("--dry_run", action="store_true")
+    return p.parse_args()
+
+
+# --------------------------------------------------------------------------- #
+#  Helpers
+# --------------------------------------------------------------------------- #
+def is_extracted(orig_name: str) -> bool:
+    """True = came from HWP BinData dump."""
+    return "BinData_BIN" in orig_name
 
 
 def compute_phash(path: Path) -> imagehash.ImageHash:
@@ -74,132 +79,239 @@ def compute_phash(path: Path) -> imagehash.ImageHash:
 
 
 def compute_color_hist(path: Path) -> np.ndarray:
-    with Image.open(path) as pil_img:
-        img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    chans = []
+    """96‑D HSV histogram."""
+    with Image.open(path) as pil:
+        bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    feats = []
     for ch in range(3):
-        h = cv2.calcHist([hsv], [ch], None, [32], [0,256])
+        h = cv2.calcHist([hsv], [ch], None, [32], [0, 256])
         cv2.normalize(h, h)
-        chans.append(h.flatten())
-    return np.concatenate(chans)
+        feats.append(h.flatten())
+    return np.concatenate(feats)
 
 
-def main():
+# --------------------------------------------------------------------------- #
+#  Mapping loader + reverse index builder
+# --------------------------------------------------------------------------- #
+def load_mapping(path: str):
+    with open(path, encoding="utf‑8") as f:
+        mp = json.load(f)
+
+    cnt = collections.Counter(
+        "extracted" if is_extracted(v["원본_파일명"]) else "original"
+        for v in mp.values()
+    )
+    u_ex = {v["원본_전체_경로"] for v in mp.values()
+            if is_extracted(v["원본_파일명"])}
+    u_ori = {v["원본_전체_경로"] for v in mp.values()
+             if not is_extracted(v["원본_파일명"])}
+
+    print(f"[INFO] Mapping rows                : {len(mp)}")
+    print(f"[INFO] Row types (extracted / orig): {cnt['extracted']} / {cnt['original']}")
+    print(f"[INFO] Unique source images         : {len(u_ex)} / {len(u_ori)}")
+    print("-" * 60)
+    return mp
+
+
+def build_reverse_index(mapping: dict):
+    """
+    Returns two dicts:
+
+        color_idx[basename] = processed_color_filename
+        gray_idx [basename] = processed_gray_filename
+    """
+    color_idx, gray_idx = {}, {}
+    for proc_name, meta in mapping.items():
+        if is_extracted(meta["원본_파일명"]):
+            continue
+        base = meta["원본_파일명"]          # e.g. "163.jpg"
+        if meta.get("채널") == "color":
+            color_idx[base] = proc_name
+        elif meta.get("채널") == "gray":
+            gray_idx[base] = proc_name
+    print(f"[INFO] Reverse index sizes (gray / color): "
+          f"{len(gray_idx)} / {len(color_idx)}")
+    print("-" * 60)
+    return gray_idx, color_idx
+
+
+# --------------------------------------------------------------------------- #
+#  Main
+# --------------------------------------------------------------------------- #
+def main() -> None:
     args = parse_args()
-    print(f"[INFO] Params: gray_ext={args.gray_extracted_dir}, gray_ori={args.gray_original_dir},")
-    print(f"        color_ext={args.color_extracted_dir}, color_ori={args.color_original_dir}, mapping={args.mapping}, dry_run={args.dry_run}")
-    print("-"*60)
 
-    # Prepare output directory
-    output_dir = Path("identity_dist")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[INFO] Ensured output directory exists: {output_dir}")
-    print("-"*60)
+    print(f"[PARAM] gray_extracted_dir : {args.gray_extracted_dir}")
+    print(f"[PARAM] gray_original_dir  : {args.gray_original_dir}")
+    print(f"[PARAM] color_extracted_dir: {args.color_extracted_dir}")
+    print(f"[PARAM] color_original_dir : {args.color_original_dir}")
+    print(f"[PARAM] mapping            : {args.mapping}")
+    print(f"[PARAM] dry_run            : {args.dry_run}")
+    print("-" * 60)
 
-    id_map = load_mapping(args.mapping)
-    gray_ext = {p.name: p for p in Path(args.gray_extracted_dir).rglob('*') if p.suffix.lower() in SUPPORTED_EXTS}
-    gray_ori = {p.name: p for p in Path(args.gray_original_dir).rglob('*') if p.suffix.lower() in SUPPORTED_EXTS}
-    color_ext = {p.name: p for p in Path(args.color_extracted_dir).rglob('*') if p.suffix.lower() in SUPPORTED_EXTS}
-    color_ori = {p.name: p for p in Path(args.color_original_dir).rglob('*') if p.suffix.lower() in SUPPORTED_EXTS}
-    print(f"[INFO] Found: gray_ext={len(gray_ext)}, gray_ori={len(gray_ori)}, color_ext={len(color_ext)}, color_ori={len(color_ori)}")
-    print("-"*60)
+    out_dir = Path("identity_dist")
+    out_dir.mkdir(exist_ok=True)
+    print(f"[INFO] Output directory ready: {out_dir}")
+    print("-" * 60)
 
-    # PHASH: gray_extracted ↔ gray_original
-    gray_items = [(fn, meta) for fn, meta in id_map.items() if meta.get("채널") == "gray"]
+    mapping = load_mapping(args.mapping)
+    rev_gray, rev_color = build_reverse_index(mapping)
+
+    # Index processed files on disk
+    gray_ext_files = {p.name: p for p in Path(args.gray_extracted_dir).rglob("*")
+                      if p.suffix.lower() in SUPPORTED_EXTS}
+    gray_ori_files = {p.name: p for p in Path(args.gray_original_dir).rglob("*")
+                      if p.suffix.lower() in SUPPORTED_EXTS}
+    color_ext_files = {p.name: p for p in Path(args.color_extracted_dir).rglob("*")
+                       if p.suffix.lower() in SUPPORTED_EXTS}
+    color_ori_files = {p.name: p for p in Path(args.color_original_dir).rglob("*")
+                       if p.suffix.lower() in SUPPORTED_EXTS}
+
+    print(f"[INFO] Indexed files  (gray ext / ori): {len(gray_ext_files)} / {len(gray_ori_files)}")
+    print(f"[INFO] Indexed files (color ext / ori): {len(color_ext_files)} / {len(color_ori_files)}")
+    print("-" * 60)
+
+    # ----------------------------------------------------------------------- #
+    #  pHash (gray channel)
+    # ----------------------------------------------------------------------- #
     phash_records = []
-    print(f"[INFO] Computing pHash for {len(gray_items)} gray pairs...")
-    for idx, (ext_name, meta) in enumerate(gray_items, 1):
-        # use preprocessed original filename if available
-        orig_rel = meta.get("원본_전체_경로")
-        ori_name = meta.get("전처리_원본_파일명") or (Path(orig_rel).name if orig_rel else None)
-        print(f"[INFO] pHash pair {idx}/{len(gray_items)}: {ext_name} vs {ori_name}")
-        p_ext = gray_ext.get(ext_name)
-        p_ori = gray_ori.get(ori_name) if ori_name else None
-        if not p_ext or not p_ori:
-            print(f"[WARN] Missing gray file for {ext_name} vs {ori_name}")
+    extracted_gray_rows = [
+        (proc_name, meta)
+        for proc_name, meta in mapping.items()
+        if meta.get("채널") == "gray" and is_extracted(meta["원본_파일명"])
+    ]
+    print(f"[INFO] pHash: processing {len(extracted_gray_rows)} gray pairs")
+
+    for idx, (proc_name, meta) in enumerate(extracted_gray_rows, 1):
+        m = BIN_RE.search(meta.get("원본_전체_경로", ""))
+        if not m:
             continue
+        dec_id = str(int(m.group(1), 16))         # '00A3' → '163'
+        ori_base = next(
+            (dec_id + ext for ext in ORIG_CANDIDATE_EXTS if (dec_id + ext) in rev_gray),
+            None
+        )
+        if ori_base is None:
+            print(f"[WARN] No original basename found for {proc_name}")
+            continue
+
+        ori_proc_name = rev_gray[ori_base]
+        p_ext = gray_ext_files.get(proc_name)
+        p_ori = gray_ori_files.get(ori_proc_name)
+
+        if not p_ext or not p_ori:
+            print(f"[WARN] Missing gray file: {proc_name} / {ori_proc_name}")
+            continue
+
         dist = int(compute_phash(p_ext) - compute_phash(p_ori))
-        phash_records.append((ext_name, ori_name, dist))
-    phash_csv = output_dir / "phash_distances.csv"
-    with phash_csv.open('w', newline='', encoding='utf-8') as f:
-        w = csv.writer(f)
-        w.writerow(["extracted_gray", "original_gray", "phash_dist"])
-        w.writerows(phash_records)
-    print(f"[SAVE] pHash distances saved to {phash_csv}, total: {len(phash_records)}")
-    print("-"*60)
+        phash_records.append((proc_name, ori_proc_name, dist))
 
-    # HIST: color_extracted ↔ color_original
-    color_items = [(fn, meta) for fn, meta in id_map.items() if meta.get("채널") == "color"]
+        if idx % 500 == 0 or idx == len(extracted_gray_rows):
+            print(f"[PROGRESS] Gray {idx}/{len(extracted_gray_rows)}")
+
+    phash_csv = out_dir / "phash_distances.csv"
+    with phash_csv.open("w", newline="", encoding="utf‑8") as f:
+        csv.writer(f).writerows([("extracted_gray", "original_gray", "phash_distance"),
+                                 *phash_records])
+    print(f"[SAVE] pHash rows written: {len(phash_records)}  →  {phash_csv}")
+    print("-" * 60)
+
+    # ----------------------------------------------------------------------- #
+    #  Hist‑color
+    # ----------------------------------------------------------------------- #
     hist_records = []
-    print(f"[INFO] Computing Hist for {len(color_items)} color pairs...")
-    for idx, (ext_name, meta) in enumerate(color_items, 1):
-        orig_rel = meta.get("원본_전체_경로")
-        ori_name = meta.get("전처리_원본_파일명") or (Path(orig_rel).name if orig_rel else None)
-        print(f"[INFO] Hist pair {idx}/{len(color_items)}: {ext_name} vs {ori_name}")
-        p_ext = color_ext.get(ext_name)
-        p_ori = color_ori.get(ori_name) if ori_name else None
-        if not p_ext or not p_ori:
-            print(f"[WARN] Missing color file for {ext_name} vs {ori_name}")
+    extracted_color_rows = [
+        (proc_name, meta)
+        for proc_name, meta in mapping.items()
+        if meta.get("채널") == "color" and is_extracted(meta["원본_파일명"])
+    ]
+    print(f"[INFO] Hist: processing {len(extracted_color_rows)} color pairs")
+
+    for idx, (proc_name, meta) in enumerate(extracted_color_rows, 1):
+        m = BIN_RE.search(meta.get("원본_전체_경로", ""))
+        if not m:
             continue
-        hd = float(cv2.compareHist(
-            compute_color_hist(p_ext), compute_color_hist(p_ori), cv2.HISTCMP_BHATTACHARYYA
+        dec_id = str(int(m.group(1), 16))
+        ori_base = next(
+            (dec_id + ext for ext in ORIG_CANDIDATE_EXTS if (dec_id + ext) in rev_color),
+            None
+        )
+        if ori_base is None:
+            print(f"[WARN] No original basename found for {proc_name}")
+            continue
+
+        ori_proc_name = rev_color[ori_base]
+        p_ext = color_ext_files.get(proc_name)
+        p_ori = color_ori_files.get(ori_proc_name)
+
+        if not p_ext or not p_ori:
+            print(f"[WARN] Missing color file: {proc_name} / {ori_proc_name}")
+            continue
+
+        dist = float(cv2.compareHist(
+            compute_color_hist(p_ext),
+            compute_color_hist(p_ori),
+            cv2.HISTCMP_BHATTACHARYYA
         ))
-        hist_records.append((ext_name, ori_name, hd))
-    hist_csv = output_dir / "hist_distances.csv"
-    with hist_csv.open('w', newline='', encoding='utf-8') as f:
-        w = csv.writer(f)
-        w.writerow(["extracted_color", "original_color", "hist_dist"])
-        w.writerows(hist_records)
-    print(f"[SAVE] Hist distances saved to {hist_csv}, total: {len(hist_records)}")
-    print("-"*60)
+        hist_records.append((proc_name, ori_proc_name, dist))
 
+        if idx % 500 == 0 or idx == len(extracted_color_rows):
+            print(f"[PROGRESS] Color {idx}/{len(extracted_color_rows)}")
+
+    hist_csv = out_dir / "hist_distances.csv"
+    with hist_csv.open("w", newline="", encoding="utf‑8") as f:
+        csv.writer(f).writerows([("extracted_color", "original_color", "hist_distance"),
+                                 *hist_records])
+    print(f"[SAVE] Hist rows written : {len(hist_records)}  →  {hist_csv}")
+    print("-" * 60)
+
+    # ----------------------------------------------------------------------- #
+    #  Plotting / thresholds
+    # ----------------------------------------------------------------------- #
     if args.dry_run:
-        print("[DONE] Dry run complete. Exiting before plotting.")
+        print("[DONE] Dry‑run complete – plotting skipped.")
         return
 
-    # Prepare value lists and check
+    # safety check
+    if not phash_records or not hist_records:
+        print("[ERROR] No distances collected – aborting plots.")
+        return
+
+    # pHash
     phash_vals = [d for *_, d in phash_records]
-    if not phash_vals:
-        print("[ERROR] No valid pHash distances found.")
-        return
-    hist_vals = [h for *_, h in hist_records]
-    if not hist_vals:
-        print("[ERROR] No valid Histogram distances found.")
-        return
-
-    # Plotting & thresholds
-    print("[PLOT] Generating histograms and CDFs...")
-    # pHash plot
     plt.figure()
     plt.hist(phash_vals, bins=50, log=True)
-    p_hist_png = output_dir / "phash_histogram.png"
-    plt.savefig(p_hist_png)
-    sorted_p = sorted(phash_vals)
-    cdf_p = np.linspace(0, 1, len(sorted_p))
+    plt.title("pHash distance distribution")
+    plt.xlabel("Hamming distance"); plt.ylabel("Frequency (log)")
+    plt.savefig(out_dir / "phash_histogram.png")
+
     plt.figure()
-    plt.plot(sorted_p, cdf_p)
-    p_cdf_png = output_dir / "phash_cdf.png"
-    plt.savefig(p_cdf_png)
+    plt.plot(np.sort(phash_vals), np.linspace(0, 1, len(phash_vals)))
+    plt.title("pHash CDF")
+    plt.xlabel("Hamming distance"); plt.ylabel("CDF")
+    plt.savefig(out_dir / "phash_cdf.png")
     thresh_p = np.percentile(phash_vals, 98)
-    print(f"[THRESHOLD] pHash 98% = {thresh_p}")
-    print(f"[SAVE] pHash plots saved: {p_hist_png}, {p_cdf_png}")
-    print("-"*60)
-    # Hist plot
+    print(f"[THRESHOLD] Suggested pHash (98th pct): {thresh_p:.0f}")
+    print("-" * 60)
+
+    # Hist
+    hist_vals = [d for *_, d in hist_records]
     plt.figure()
     plt.hist(hist_vals, bins=50, log=True)
-    h_hist_png = output_dir / "histogram.png"
-    plt.savefig(h_hist_png)
-    sorted_h = sorted(hist_vals)
-    cdf_h = np.linspace(0, 1, len(sorted_h))
+    plt.title("Color‑hist distance distribution")
+    plt.xlabel("Bhattacharyya distance"); plt.ylabel("Frequency (log)")
+    plt.savefig(out_dir / "hist_histogram.png")
+
     plt.figure()
-    plt.plot(sorted_h, cdf_h)
-    h_cdf_png = output_dir / "hist_cdf.png"
-    plt.savefig(h_cdf_png)
+    plt.plot(np.sort(hist_vals), np.linspace(0, 1, len(hist_vals)))
+    plt.title("Color‑hist CDF")
+    plt.xlabel("Bhattacharyya distance"); plt.ylabel("CDF")
+    plt.savefig(out_dir / "hist_cdf.png")
     thresh_h = np.percentile(hist_vals, 97)
-    print(f"[THRESHOLD] Hist 97% = {thresh_h}")
-    print(f"[SAVE] Hist plots saved: {h_hist_png}, {h_cdf_png}")
+    print(f"[THRESHOLD] Suggested Hist (97th pct): {thresh_h:.4f}")
     print("[DONE] Analysis complete.")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
