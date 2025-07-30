@@ -8,15 +8,16 @@
 
 # 3_A_search_threshold.py
 
-- python 3_A_search_threshold.py processed/extracted/low/gray  processed/original/low/gray processed/extracted/low/color processed/original/low/color --mapping preprocess_mapping.json
+- python 3_A_search_threshold.py processed/extracted  processed/original --mapping preprocess_mapping.json
 
 # 3_mk_phash_candidates
 
-- python 3_mk_phash_candidates.py processed/extracted/low/gray processed/original/low/gray processed/extracted/low/color processed/original/low/color candidates.json --mapping preprocess_mapping.json --phash-threshold 18 --hist-threshold 0.3 --topk 20
+- python 3_mk_phash_candidates.py processed/extracted  processed/original  output/candidates.json --mapping preprocess_mapping.json --phash-threshold 38 --hist-threshold 0.81
+
 
 # 4_verify_mapping
 
-- python 4_verify_mapping.py out_candidates.json processed/extracted/gray processed/original/gray processed/extracted/color processed/original/color final_mapping.json
+- python 4_verify_mapping.py candidates.json processed/extracted/gray processed/original/gray processed/extracted/color processed/original/color final_mapping.json
 
 # 5_check_map_result
 

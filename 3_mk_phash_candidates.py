@@ -1,200 +1,227 @@
-#!/usr/bin/env python3
+# 3_mk_phash_candidates.py
 """
-Global candidate generation using pHash + Color Histogram with identity mapping via preprocess_mapping.json
-  • Ensures gray & color images align by original source identity
-  • Two-stage filtering: pHash distance ≤ threshold AND histogram distance ≤ threshold AND identical source
-  • Returns top-K most similar candidates for each base image
-  • Outputs mapping as JSON: {"basename.png": [{"name": candidate.png, "type": "pHash+Hist"}, ...]}
-  • Detailed print() logs for parameter summary, input counts, per-image progress, and result summary
+3_mk_phash_candidates.py
+========================
+Generate pHash + HSV‑histogram‑based candidate lists for each original image.
+
+Key points
+----------
+* `preprocess_mapping.json` is the **single source of truth** for track (low/high),
+  channel (gray/color) and original‑image identity (`원본_전체_경로`).
+* A file belongs to **processed/extracted** if its identity path contains
+  `"BinData"`, otherwise to **processed/original**.
+* Images are split by `(track, channel)`; tracks are processed independently
+  so that low/high resolutions never mix.
+* For every gray image in the **smaller side** (extracted vs original), find
+  candidates on the opposite side that satisfy:
+
+  1. pHash Hamming distance ≤ `--phash-threshold`
+  2. Bhattacharyya distance between HSV histograms ≤ `--hist-threshold`
+  3. Different original identity (이미 매핑된 동일 원본은 제외)
+
+* Results are written as JSON mapping original‑ID → candidate list::
+
+    {
+        "C:/…/1.jpg": {
+            "track": "high",
+            "candidates": [
+                { "name": "C:/…/9.jpg",  "phash": 24, "hist": 0.62 },
+                { "name": "C:/…/27.jpg", "phash": 31, "hist": 0.73 }
+            ]
+        },
+        …
+    }
+
 Usage
 -----
 python 3_mk_phash_candidates.py \
-  path/to/extracted/low/gray \
-  path/to/original/low/gray \
-  path/to/extracted/low/color \
-  path/to/original/low/color \
-  output/candidates.json \
-  --mapping preprocess_mapping.json \
-  [--phash-threshold 18] \
-  [--hist-threshold 0.3] \
-  [--topk 20]
+       processed/extracted  processed/original  out/candidates.json \
+       --mapping preprocess_mapping.json \
+       [--phash-threshold 38] [--hist-threshold 0.81]
 """
+from __future__ import annotations
+
 import argparse
 import json
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from PIL import Image
-import imagehash
+
 import cv2
+import imagehash
 import numpy as np
+from PIL import Image
 
 SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".gif"}
-DEFAULT_PHASH_THRESH = 18
-DEFAULT_HIST_THRESH = 0.3
-DEFAULT_TOPK = 20
 
 
-def compute_phash(path: Path) -> imagehash.ImageHash:
-    with Image.open(path) as img:
-        return imagehash.phash(img)
+# ---------------------------------------------------------------------------#
+# CLI                                                                        #
+# ---------------------------------------------------------------------------#
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Generate candidate list keyed by original photo path"
+    )
+    p.add_argument("extracted_root")
+    p.add_argument("original_root")
+    p.add_argument("out_json")
+    p.add_argument("--mapping", required=True)
+    p.add_argument("--phash-threshold", type=int, default=38)
+    p.add_argument("--hist-threshold", type=float, default=0.81)
+    return p.parse_args()
 
 
-def compute_color_hist(path: Path) -> np.ndarray:
-    with Image.open(path) as pil_img:
-        img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    chans = []
-    for ch in range(3):
-        h = cv2.calcHist([hsv], [ch], None, [32], [0,256])
+# ---------------------------------------------------------------------------#
+# Helpers                                                                    #
+# ---------------------------------------------------------------------------#
+def norm_channel(ch: str) -> str:
+    """Normalize channel name to 'gray' or 'color'."""
+    ch = ch.lower().split("_")[0]
+    return "gray" if ch.startswith(("gray", "grey")) else "color"
+
+
+def compute_phash(p: Path):
+    with Image.open(p) as im:
+        return imagehash.phash(im)
+
+
+def compute_hist(p: Path):
+    with Image.open(p) as im:
+        bgr = cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    feats = [cv2.calcHist([hsv], [c], None, [32], [0, 256]) for c in range(3)]
+    for h in feats:
         cv2.normalize(h, h)
-        chans.append(h.flatten())
-    return np.concatenate(chans)
+    return np.concatenate([h.flatten() for h in feats])
 
 
+# ---------------------------------------------------------------------------#
+# Main                                                                       #
+# ---------------------------------------------------------------------------#
 def main():
-    pa = argparse.ArgumentParser(description="pHash+Hist 후보군 생성 with original identity mapping via preprocess_mapping.json")
-    pa.add_argument("extracted_gray", help="processed/extracted/low/gray 디렉토리")
-    pa.add_argument("original_gray", help="processed/original/low/gray 디렉토리")
-    pa.add_argument("extracted_color", help="processed/extracted/low/color 디렉토리")
-    pa.add_argument("original_color", help="processed/original/low/color 디렉토리")
-    pa.add_argument("out_json", help="출력 후보군 JSON 경로")
-    pa.add_argument("--mapping", required=True, help="preprocess_mapping.json 경로")
-    pa.add_argument("--phash-threshold", type=int, default=DEFAULT_PHASH_THRESH,
-                    help=f"pHash 해밍 거리 임계값 (기본: {DEFAULT_PHASH_THRESH})")
-    pa.add_argument("--hist-threshold", type=float, default=DEFAULT_HIST_THRESH,
-                    help=f"Histogram 거리 임계값 (기본: {DEFAULT_HIST_THRESH})")
-    pa.add_argument("--topk", type=int, default=DEFAULT_TOPK,
-                    help=f"최종 후보 상위 K개 (기본: {DEFAULT_TOPK})")
-    args = pa.parse_args()
+    args = parse_args()
+    ex_root = Path(args.extracted_root).resolve()
+    or_root = Path(args.original_root).resolve()
+    print("[PARAM]", vars(args))
 
-    # Load identity mapping
-    with open(args.mapping, encoding='utf-8') as mf:
-        id_map = json.load(mf)
+    # --------------------------------------------------------------------- #
+    # Load mapping JSON                                                     #
+    # --------------------------------------------------------------------- #
+    with open(args.mapping, encoding="utf-8") as f:
+        mp = json.load(f)
 
-    phash_thresh = args.phash_threshold
-    hist_thresh = args.hist_threshold
-    topk = args.topk
+    # Split files into extracted / original dictionaries keyed by (track,ch)
+    extracted: dict[tuple[str, str], list[Path]] = defaultdict(list)
+    original:  dict[tuple[str, str], list[Path]] = defaultdict(list)
 
-    print(f"[START] pHash ≤ {phash_thresh} & Hist ≤ {hist_thresh} & same identity → Top-{topk} 후보 생성 시작")
-
-    # Directory setup
-    gray_ext_dir = Path(args.extracted_gray)
-    gray_ori_dir = Path(args.original_gray)
-    color_ext_dir = Path(args.extracted_color)
-    color_ori_dir = Path(args.original_color)
-    out_path = Path(args.out_json)
-
-    # Collect files
-    ext_gray = [p for p in gray_ext_dir.rglob('*') if p.suffix.lower() in SUPPORTED_EXTS]
-    ori_gray = [p for p in gray_ori_dir.rglob('*') if p.suffix.lower() in SUPPORTED_EXTS]
-    ext_color = [p for p in color_ext_dir.rglob('*') if p.suffix.lower() in SUPPORTED_EXTS]
-    ori_color = [p for p in color_ori_dir.rglob('*') if p.suffix.lower() in SUPPORTED_EXTS]
-    print(f"[INFO] Gray — Extracted: {len(ext_gray)}, Original: {len(ori_gray)}")
-    print(f"[INFO] Color — Extracted: {len(ext_color)}, Original: {len(ori_color)}")
-
-    # Compute pHash for gray images
-    print("[INFO] Gray pHash 계산 중...")
-    ext_hashes = {p: compute_phash(p) for p in ext_gray}
-    ori_hashes = {p: compute_phash(p) for p in ori_gray}
-    print("[DONE] Gray pHash 완료")
-
-    # Determine basis vs compare set
-    if len(ori_hashes) <= len(ext_hashes):
-        basis_hashes, compare_hashes = ori_hashes, ext_hashes
-        basis_gray_root, compare_gray_root = gray_ori_dir, gray_ext_dir
-        basis_color_root, compare_color_root = color_ori_dir, color_ext_dir
-        basis_label = 'original'
-    else:
-        basis_hashes, compare_hashes = ext_hashes, ori_hashes
-        basis_gray_root, compare_gray_root = gray_ext_dir, gray_ori_dir
-        basis_color_root, compare_color_root = color_ext_dir, color_ori_dir
-        basis_label = 'extracted'
-    print(f"[INFO] 기준 세트: {basis_label} ({len(basis_hashes)}) vs 비교 세트 ({len(compare_hashes)})")
-
-    # Cache compare histograms
-    print("[INFO] 컬러 히스토그램 캐시 생성중...")
-    compare_hists = {}
-    for img_path in compare_color_root.rglob('*'):
-        if img_path.suffix.lower() not in SUPPORTED_EXTS:
-            continue
-        key = img_path.name
-        try:
-            compare_hists[key] = compute_color_hist(img_path)
-        except Exception as e:
-            print(f"[WARN] Hist 실패: {img_path.name}: {e}")
-    print(f"[DONE] Hist 캐시 완료: {len(compare_hists)} items")
-
-    # Generate candidates
-    mapping = {}
-    total = len(basis_hashes)
-    for idx, (bpath, bhash) in enumerate(basis_hashes.items(), start=1):
-        bkey = bpath.name
-        orig_id = id_map.get(bkey, {}).get('원본_전체_경로')
-        rel_gray = bpath.relative_to(basis_gray_root).as_posix()
-        print(f"[{idx:03d}/{total}] 처리: {rel_gray}")
-
-        if not orig_id:
-            print(f"[WARN] 매핑 정보 없음: {bkey}")
-            mapping[rel_gray] = []
+    for name, meta in mp.items():
+        track = meta.get("트랙", "").lower()
+        ch = norm_channel(meta.get("채널", ""))
+        if not track or not ch:
             continue
 
-        # Find corresponding color preprocessed filename(s)
-        color_candidates = [fname for fname, meta in id_map.items()
-                            if meta.get('채널')=='color' and meta.get('원본_전체_경로')==orig_id]
-        if not color_candidates:
-            print(f"[WARN] 기준 컬러 없음 (identity): {bkey}")
-            mapping[rel_gray] = []
+        rel_path = Path(track) / ch / name
+        is_extracted = "BinData" in meta.get("원본_전체_경로", "")
+        full_path = (ex_root if is_extracted else or_root) / rel_path
+        if full_path.is_file():
+            (extracted if is_extracted else original)[(track, ch)].append(full_path)
+
+    # Quick lookup: (원본_전체_경로, track, channel) → pre‑processed filename
+    id2name = {
+        (m["원본_전체_경로"], m["트랙"].lower(), norm_channel(m["채널"])): n
+        for n, m in mp.items()
+    }
+
+    out: dict[str, dict] = {}
+    basis_cnt = cand_cnt = 0
+
+    # --------------------------------------------------------------------- #
+    # Process each track independently                                      #
+    # --------------------------------------------------------------------- #
+    for track in {"low", "high"}:
+        gray_ext = extracted.get((track, "gray"), [])
+        gray_ori = original.get((track, "gray"), [])
+        if not gray_ext or not gray_ori:
             continue
 
-        # Use first matched color file
-        cfile = color_candidates[0]
-        basis_color_path = basis_color_root / cfile
-        if not basis_color_path.exists():
-            print(f"[WARN] 파일 미발견: {basis_color_path}")
-            mapping[rel_gray] = []
-            continue
+        # Always iterate over the smaller gray set for efficiency
+        basis_gray, basis_side = (
+            (gray_ori, "original") if len(gray_ori) <= len(gray_ext) else (gray_ext, "extracted")
+        )
+        compare_gray = gray_ext if basis_side == "original" else gray_ori
+        compare_color_root = (ex_root if basis_side == "original" else or_root) / track / "color"
 
-        # Compute basis histogram
-        try:
-            basis_hist = compute_color_hist(basis_color_path)
-        except Exception as e:
-            print(f"[ERROR] Hist 오류: {basis_color_path.name}: {e}")
-            mapping[rel_gray] = []
-            continue
+        # Pre‑compute pHash for both sides
+        h_basis = {p: compute_phash(p) for p in basis_gray}
+        h_compare = {p: compute_phash(p) for p in compare_gray}
 
-        # pHash distances
-        pdists = [(p.relative_to(compare_gray_root).as_posix(), bhash - h)
-                  for p,h in compare_hashes.items()]
-        pdists.sort(key=lambda x: x[1])
-        phash_pass = sum(1 for _,d in pdists if d<=phash_thresh)
-
-        # Filter by identity & histogram
-        candidates = []
-        hist_pass = 0
-        for rel, dist in pdists:
-            if dist>phash_thresh:
-                break
-            ck = Path(rel).name
-            cid = id_map.get(ck,{}).get('원본_전체_경로')
-            if cid!=orig_id:
+        # Cache HSV histograms for color images (index by gray & color names)
+        hist_compare: dict[str, np.ndarray] = {}
+        for p in compare_color_root.iterdir():
+            if p.suffix.lower() not in SUPPORTED_EXTS:
                 continue
-            hvec = compare_hists.get(ck)
-            if hvec is None:
+            hv = compute_hist(p)
+            hist_compare[p.name] = hv
+            m = mp.get(p.name)
+            if m:
+                gname = id2name.get((m["원본_전체_경로"], track, "gray"))
+                if gname:
+                    hist_compare[gname] = hv
+
+        # ---------------------------------------------------------------- #
+        # Candidate search per gray basis image                            #
+        # ---------------------------------------------------------------- #
+        for bpath, bhash in h_basis.items():
+            basis_cnt += 1
+            mid = mp[bpath.name]["원본_전체_경로"]
+            entry = out.setdefault(mid, {"track": track, "candidates": []})
+
+            # Need histogram of the basis image's *color* counterpart
+            c_name = id2name.get((mid, track, "color"))
+            if not c_name:
                 continue
-            hd = cv2.compareHist(basis_hist, hvec, cv2.HISTCMP_BHATTACHARYYA)
-            if hd<=hist_thresh:
-                hist_pass+=1
-                candidates.append({"name": rel, "type": "pHash+Hist"})
-                if len(candidates)>=topk:
-                    break
+            c_path = (
+                (or_root if basis_side == "original" else ex_root)
+                / track / "color" / c_name
+            )
+            basis_hist = compute_hist(c_path)
 
-        print(f"▶ pHash 통과: {phash_pass} → Identity+Hist: {hist_pass} → 채택: {len(candidates)}")
-        mapping[rel_gray] = candidates
+            # pHash filter then histogram check
+            pdists = [(cp, bhash - h_compare[cp]) for cp in h_compare]
+            pdists.sort(key=lambda x: x[1])  # ascending distance
 
-    # Save JSON
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, 'w', encoding='utf-8') as f:
-        json.dump(mapping, f, ensure_ascii=False, indent=2)
-    print(f"[SAVE] 후보군 JSON 저장완료: {out_path} ({len(mapping)} items)")
+            for cp, pdist in pdists:
+                if pdist > args.phash_threshold:
+                    break  # remaining pairs are even farther
 
-if __name__ == '__main__':
+                c_id = mp[cp.name]["원본_전체_경로"]
+                if c_id == mid:  # skip same original
+                    continue
+
+                hvec = hist_compare.get(cp.name)
+                if hvec is None:
+                    continue
+
+                hdist = cv2.compareHist(basis_hist, hvec, cv2.HISTCMP_BHATTACHARYYA)
+                if hdist <= args.hist_threshold:
+                    entry["candidates"].append(
+                        {"name": c_id, "phash": int(pdist), "hist": round(float(hdist), 4)}
+                    )
+                    cand_cnt += 1
+
+    # --------------------------------------------------------------------- #
+    # Save results                                                          #
+    # --------------------------------------------------------------------- #
+    Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
+    with open(args.out_json, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+
+    now_kst = datetime.now(timezone(timedelta(hours=9))).isoformat(timespec="seconds")
+    print(
+        f"[SAVE] {args.out_json}  |  basis={basis_cnt:,}  "
+        f"candidates={cand_cnt:,}  |  {now_kst}"
+    )
+
+
+if __name__ == "__main__":
     main()
