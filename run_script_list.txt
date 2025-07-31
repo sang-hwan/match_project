@@ -12,12 +12,15 @@
 
 # 3_mk_phash_candidates
 
-- python 3_mk_phash_candidates.py processed/extracted  processed/original  output/candidates.json --mapping preprocess_mapping.json --phash-threshold 38 --hist-threshold 0.81
+- python 3_mk_phash_candidates.py processed/extracted  processed/original candidates.json --mapping preprocess_mapping.json --phash-threshold 28 --hist-threshold 0.30
 
+# 4_A_verify_data
+
+- python 4_A_verify_data.py --candidates candidates.json --mapping preprocess_mapping.json
 
 # 4_verify_mapping
 
-- python 4_verify_mapping.py candidates.json processed/extracted/gray processed/original/gray processed/extracted/color processed/original/color final_mapping.json
+- python 4_verify_mapping.py --candidates candidates.json --mapping preprocess_mapping.json --img-root all_images_root --output mapping_result.json
 
 # 5_check_map_result
 
