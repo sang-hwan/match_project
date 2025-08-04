@@ -1,24 +1,54 @@
 # 6_replace_stream.py
 """
-HWP OLE 스트림 레벨에서 BinData 스트림을 외부 이미지로 교체하는 스크립트
-  • 원본 포맷(raw JPEG/PNG 포함) 및 해상도 유지(필요시 축소)
-  • raw deflate(wbits=-MAX_WBITS) 로 재압축
-  • JPEG일 경우 품질(quality)을 동적으로 낮춰 원본 크기 이하로 맞춤
-  • PNG일 경우 optimize=True 옵션 적용
-  • 최종 압축이 원본보다 작으면 0x00 패딩, 클 경우 안전한 트리밍/해상도 축소 후 디컴프레션 검증
+Replace *BinData* streams in an HWP (OLE compound) file with external images
+according to a JSON mapping.
+
+Key features
+------------
+* Keeps the original image format (raw JPEG/PNG/BMP) & resolution where possible.
+* Re-compresses image payload with raw DEFLATE (wbits=-MAX_WBITS).
+* JPEG: iteratively lowers *quality* until compressed payload ≤ original size.
+* PNG: saves with `optimize=True`.
+* If the new compressed stream is **smaller**, pads with `0x00`.
+  If it is **larger**, tries safe trimming or progressively down-scales until
+  the compressed payload fits and is decompressible.
+
+Usage
+-----
+python 6_replace_stream.py \
+  --map-json mapping_result.json \
+  --src-hwp  "target_data/기계설비 성능점검 결과보고서(종합 1).hwp" \
+  --dst-hwp  "target_data/기계설비 성능점검 결과보고서(종합 1)_수정본.hwp"
+
+`mapping_result.json` must be a JSON object where **either** the key or the
+value contains the BinData image path. The script automatically detects
+whether the mapping direction is `BinData → original` (legacy) or
+`original → BinData` (current).
+
+All log messages and comments are in English for portability.
 """
 
+from __future__ import annotations
+
+import argparse
+import json
+import os
 import shutil
 import zlib
-import olefile
-import os
-import json
 from io import BytesIO
+from typing import Dict, Tuple
+
+import olefile
 from PIL import Image
-import argparse
+
+# Helper functions
 
 def parse_src_path(raw: str) -> str:
-    """raw: 'target_data_자동…_20_jpg.png' → 'target_data/자동…/20.jpg'"""
+    """Best-effort fallback when `raw` is a compact, underscore-separated path.
+
+    Example:
+        'target_data_자동…_20_jpg.png' -> 'target_data/자동…/20.jpg'
+    """
     try:
         raw = raw.strip()
         p0, p1, rest = raw.split('_', 2)
@@ -29,190 +59,211 @@ def parse_src_path(raw: str) -> str:
         num, ext = file_base.split('_', 1)
         return os.path.join(base_folder, album, subfolder, f"{num}.{ext}")
     except Exception:
-        print(f"[WARN] parse_src_path: unexpected format, using raw: {raw}")
+        print(f"[WARN] parse_src_path: unexpected format, returning the raw string: {raw}")
         return raw
 
+
 def safe_decompressable(data: bytes) -> bool:
-    """잘린 DEFLATE 데이터가 디컴프레션 가능한지 확인"""
+    """Return True if `data` can be inflated by zlib without error."""
     try:
         zlib.decompress(data, -zlib.MAX_WBITS)
         return True
     except zlib.error:
         return False
 
-def compress_image(img: Image.Image, fmt: str, orig_size: int):
+
+def compress_image(img: Image.Image, fmt: str, orig_size: int) -> Tuple[bytes, bytes]:
+    """Re-compress `img` with the given `fmt` trying not to exceed `orig_size`.
+
+    Returns:
+        raw_bytes: The re-encoded raw image data.
+        comp_bytes: The raw-deflate compressed payload to store in the HWP stream.
     """
-    주어진 PIL 이미지에 대해 fmt 포맷으로 재압축 시도.
-    JPEG이면 품질 루프, PNG면 optimize, 기타는 기본 재압축.
-    (new_raw, new_comp) 반환.
-    """
-    if fmt in ('JPEG', 'JPG'):
-        last_candidate = last_comp = None
+    fmt_upper = fmt.upper()
+    if fmt_upper in {"JPEG", "JPG"}:
+        last_raw = last_comp = None
         for q in range(95, 9, -5):
             buf = BytesIO()
-            img.save(buf, format='JPEG', quality=q)
+            img.save(buf, format="JPEG", quality=q)
             data = buf.getvalue()
-            comp = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+
+            comp = zlib.compressobj(level=9, method=zlib.DEFLATED, wbits=-zlib.MAX_WBITS)
             comp_data = comp.compress(data) + comp.flush()
-            print(f"[DEBUG] JPEG quality={q}, 압축 크기={len(comp_data)} bytes")
+
+            print(f"[DEBUG] JPEG quality={q}, compressed={len(comp_data)} bytes")
+
             if len(comp_data) <= orig_size:
-                print(f"[INFO] 선택된 JPEG quality={q}, 크기 맞춤 성공")
+                print(f"[INFO] Selected JPEG quality={q} (fits original stream)")
                 return data, comp_data
-            last_candidate, last_comp = data, comp_data
-        print(f"[WARN] 모든 품질에서 크기 초과, 마지막 quality 사용")
-        return last_candidate, last_comp
 
-    elif fmt == 'PNG':
+            last_raw, last_comp = data, comp_data
+
+        print("[WARN] All quality levels exceeded the original size; using the last candidate")
+        return last_raw, last_comp  # type: ignore[return-value]
+
+    if fmt_upper == "PNG":
         buf = BytesIO()
-        img.save(buf, format='PNG', optimize=True)
+        img.save(buf, format="PNG", optimize=True)
         data = buf.getvalue()
-        comp = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+
+        comp = zlib.compressobj(level=9, method=zlib.DEFLATED, wbits=-zlib.MAX_WBITS)
         comp_data = comp.compress(data) + comp.flush()
-        print(f"[DEBUG] PNG(optimize) 압축 후 크기={len(comp_data)} bytes")
+
+        print(f"[DEBUG] PNG(optimize) compressed={len(comp_data)} bytes")
         return data, comp_data
 
-    else:
-        buf = BytesIO()
-        img.save(buf, format=fmt)
-        data = buf.getvalue()
-        comp = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
-        comp_data = comp.compress(data) + comp.flush()
-        print(f"[DEBUG] 기타 포맷({fmt}) 압축 후 크기={len(comp_data)} bytes")
-        return data, comp_data
+    # Fallback for BMP or other formats
+    buf = BytesIO()
+    img.save(buf, format=fmt_upper)
+    data = buf.getvalue()
 
-def replace_streams(src: str, dst: str, mapping: dict[str, str]) -> None:
+    comp = zlib.compressobj(level=9, method=zlib.DEFLATED, wbits=-zlib.MAX_WBITS)
+    comp_data = comp.compress(data) + comp.flush()
+
+    print(f"[DEBUG] {fmt_upper} compressed={len(comp_data)} bytes")
+    return data, comp_data
+
+# Core replacement routine
+
+def replace_streams(src: str, dst: str, mapping: Dict[str, Tuple[str, str]]) -> None:
     total = replaced = decompress_fail = trim_fail = 0
 
     shutil.copy2(src, dst)
-    print(f"[INFO] 복사된 파일: {dst}")
+    print(f"[INFO] Copied source HWP to '{dst}'")
 
     ole = olefile.OleFileIO(dst, write_mode=True)
     all_streams = ole.listdir(streams=True)
-    print("[DEBUG] 내부 스트림 목록:")
-    for p in all_streams:
-        print("  -", p)
+    print("[DEBUG] Listing OLE streams inside the document:")
+    for stream in all_streams:
+        print("  -", stream)
 
-    for leaf, orig_img_path in mapping.items():
+    for leaf, (orig_img_path, ext) in mapping.items():
         total += 1
-        print(f"\n[STEP] 스트림 leaf: {leaf}, 교체할 이미지 경로: {orig_img_path}")
-        target = next((p for p in all_streams
-                       if p[0]=='BinData' and p[1].upper()==leaf.upper()), None)
+        print(f"\n[STEP] Processing stream leaf='{leaf}', image='{orig_img_path}'")
+
+        target = next((s for s in all_streams if s[0] == "BinData" and s[1].upper() == leaf.upper()), None)
         if not target:
-            print(f"[WARN] 해당 스트림 없음: {leaf}")
+            print(f"[WARN] Stream not found: {leaf}")
             continue
-        print(f"[INFO] 스트림 발견: {target}")
+
+        print(f"[INFO] Stream located: {target}")
 
         orig_comp = ole.openstream(target).read()
         orig_size = len(orig_comp)
-        print(f"[DEBUG] 기존 압축 데이터 크기: {orig_size} bytes")
+        print(f"[DEBUG] Original compressed size: {orig_size} bytes")
 
-        # RAW JPEG/PNG 스트림은 압축 해제 없이 원본 raw 사용
-        if leaf.lower().endswith(('.jpg','.jpeg','.png')):
-            print("[INFO] RAW 포맷 스트림으로 간주, 압축 해제 없이 사용")
+        # Determine raw image data
+        if ext.lower() in {".jpg", ".jpeg", ".png", ".bmp"}:
+            print("[INFO] Treating as RAW image stream (no decompression needed)")
             raw = orig_comp
         else:
             try:
                 raw = zlib.decompress(orig_comp, -zlib.MAX_WBITS)
-                print(f"[DEBUG] raw deflate 해제 성공, 크기: {len(raw)} bytes")
+                print(f"[DEBUG] Raw DEFLATE decompressed: {len(raw)} bytes")
             except zlib.error:
                 try:
                     raw = zlib.decompress(orig_comp)
-                    print(f"[DEBUG] zlib wrapper 해제 성공, 크기: {len(raw)} bytes")
-                except zlib.error as e:
-                    print(f"[ERROR] 압축 해제 실패: {e}")
+                    print(f"[DEBUG] zlib wrapper decompressed: {len(raw)} bytes")
+                except Exception as e:
+                    print(f"[ERROR] Decompression failure: {e}")
                     decompress_fail += 1
                     continue
 
-        # 원본 이미지 열기
+        if not os.path.exists(orig_img_path):
+            print(f"[ERROR] Image file not found: {orig_img_path}")
+            continue
+
+        try:
+            mapping_img = Image.open(orig_img_path)
+        except Exception as e:
+            print(f"[ERROR] Failed to open image: {e}")
+            continue
+
         try:
             orig_img = Image.open(BytesIO(raw))
-            orig_w, orig_h = orig_img.size
-            print(f"[DEBUG] 원본 이미지 해상도: {orig_w}×{orig_h}")
         except Exception as e:
-            print(f"[ERROR] raw 이미지 열기 실패: {e}")
-            decompress_fail += 1
+            print(f"[ERROR] Failed to decode original image: {e}")
             continue
 
-        # 매핑 이미지 로드 & 리사이즈
-        if not os.path.isfile(orig_img_path):
-            print(f"[ERROR] 이미지 파일 없음: {orig_img_path}")
-            continue
-        mapping_img = Image.open(orig_img_path)
-        resized = mapping_img.convert(orig_img.mode).resize((orig_w,orig_h))
-        print(f"[DEBUG] 매핑 이미지 크기 조정: {mapping_img.size} → {(orig_w,orig_h)}")
+        orig_w, orig_h = orig_img.size
+        print(f"[DEBUG] Original resolution: {orig_w}×{orig_h}")
 
-        fmt = (orig_img.format or mapping_img.format or 'PNG').upper()
-        new_raw, new_comp = compress_image(resized, fmt, orig_size)
-        comp_size = len(new_comp)
+        if mapping_img.size != (orig_w, orig_h):
+            print(f"[DEBUG] Resizing replacement {mapping_img.size} -> {(orig_w, orig_h)}")
+            mapping_img = mapping_img.resize((orig_w, orig_h))
 
-        # 패딩
-        if comp_size < orig_size:
-            pad = orig_size - comp_size
-            new_comp += b'\x00' * pad
-            print(f"[DEBUG] 패딩 적용: {pad} bytes, 최종 크기={len(new_comp)} bytes")
+        fmt = orig_img.format or ext.lstrip('.').upper()
+        new_raw, new_comp = compress_image(mapping_img.convert(orig_img.mode), fmt, orig_size)
 
-        # 트리밍
+        # Padding if compressed data is smaller
+        if len(new_comp) < orig_size:
+            pad = orig_size - len(new_comp)
+            new_comp += b"\x00" * pad
+            print(f"[DEBUG] Applied padding: {pad} bytes, final={len(new_comp)} bytes")
+
+        # Trimming if compressed data is larger
         if len(new_comp) > orig_size:
             trimmed = new_comp[:orig_size]
-            print(f"[WARN] 크기 초과({len(new_comp)}->{orig_size} bytes), 안전 트리밍 시도...")
+            print(f"[WARN] Oversized stream ({len(new_comp)}->{orig_size}), attempting safe trim…")
             if safe_decompressable(trimmed):
                 new_comp = trimmed
-                print(f"[INFO] 트리밍 검증 성공, 최종 크기={len(new_comp)} bytes")
+                print(f"[INFO] Trim valid, final size={len(new_comp)} bytes")
             else:
-                # 해상도 축소 후 재시도
-                print("[WARN] 트리밍 실패, 해상도 축소 후 재시도합니다.")
+                print("[WARN] Trim invalid; attempting down-scaling…")
                 success = False
-                for scale in (0.9,0.8,0.7,0.6,0.5):
-                    w2 = int(orig_w*scale); h2 = int(orig_h*scale)
-                    r2 = mapping_img.convert(orig_img.mode).resize((w2,h2))
-                    raw2, comp2 = compress_image(r2, fmt, orig_size)
+                for scale in (0.9, 0.8, 0.7, 0.6, 0.5):
+                    w2 = int(orig_w * scale)
+                    h2 = int(orig_h * scale)
+                    r2 = mapping_img.convert(orig_img.mode).resize((w2, h2))
+
+                    _, comp2 = compress_image(r2, fmt, orig_size)
+
                     if len(comp2) <= orig_size and safe_decompressable(comp2):
-                        # 패딩
                         if len(comp2) < orig_size:
-                            comp2 += b'\x00'*(orig_size-len(comp2))
+                            comp2 += b"\x00" * (orig_size - len(comp2))
                         new_comp = comp2
-                        print(f"[INFO] 해상도 {int(scale*100)}% 축소 후 최적화 성공, 최종 크기={len(new_comp)} bytes")
+                        print(f"[INFO] Down-scale to {int(scale*100)}% solved size issue ({len(new_comp)} bytes)")
                         success = True
                         break
                 if not success:
-                    print("[ERROR] 해상도 축소 후에도 실패: 스트림 스킵")
+                    print("[ERROR] Down-scaling also failed; skipping this stream.")
                     trim_fail += 1
                     continue
 
-        # 스트림 덮어쓰기
         ole.write_stream(target, new_comp)
-        print(f"[INFO] 스트림 {target} 덮어쓰기 완료, 크기: {len(new_comp)} bytes")
         replaced += 1
+        print(f"[INFO] Stream {target} overwritten (size {len(new_comp)} bytes)")
 
     ole.close()
-    # 요약
-    print(f"\n[SUMMARY] 전체스트림={total}, 교체성공={replaced}, "
-          f"압축해제실패={decompress_fail}, 트리밍실패={trim_fail}")
+    print(f"\n[SUMMARY] total={total}, replaced={replaced}, decompress_fail={decompress_fail}, trim_fail={trim_fail}")
 
-if __name__ == '__main__':
-    pa = argparse.ArgumentParser(
-        description='HWP BinData 스트림을 매핑 정보에 따라 교체합니다.'
-    )
-    pa.add_argument('--map-json','-m', required=True, help='mapping JSON 파일')
-    pa.add_argument('--src-hwp','-s', required=True, help='원본 HWP 파일 경로')
-    pa.add_argument('--dst-hwp','-d', required=True, help='대상 HWP 파일 경로')
-    args = pa.parse_args()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Replace BinData streams in an HWP file using an image mapping.")
+    parser.add_argument("--map-json", required=True, help="Path to mapping_result.json")
+    parser.add_argument("--src-hwp", required=True, help="Source .hwp file to patch")
+    parser.add_argument("--dst-hwp", required=True, help="Destination .hwp to write")
+    args = parser.parse_args()
 
-    raw_map = json.load(open(args.map_json,'r',encoding='utf-8'))
-    original_map: dict[str,str] = {}
-    for k,v in raw_map.items():
-        if 'BinData' in k:
-            h,v2 = k,v
-        elif 'BinData' in v:
-            h,v2 = v,k
+    raw_map = json.load(open(args.map_json, encoding="utf-8"))
+    original_map: Dict[str, Tuple[str, str]] = {}
+    for k, v in raw_map.items():
+        if "BinData" in k:
+            bin_path, img_path = k, v
+        elif "BinData" in v:
+            bin_path, img_path = v, k
         else:
-            h,v2 = k,v
-        fname = os.path.basename(h)
-        body = fname.split('_BinData_',1)[1] if '_BinData_' in fname else fname
-        leaf = (body[:-4] if body.lower().endswith('.png') else body)
-        if '_' in leaf:
-            b, e = leaf.rsplit('_',1); leaf = f"{b}.{e}"
-        real = v2 if os.path.exists(v2) else parse_src_path(v2)
-        original_map[leaf] = real
+            bin_path, img_path = k, v
+
+        fname = os.path.basename(bin_path)
+        body = fname.split("_BinData_", 1)[1] if "_BinData_" in fname else fname
+        name, ext = os.path.splitext(body)
+        leaf = name
+
+        if "_" in leaf:
+            b, e = leaf.rsplit("_", 1)
+            leaf = f"{b}.{e}"
+
+        img_path_resolved = img_path if os.path.exists(img_path) else parse_src_path(img_path)
+        original_map[leaf] = (img_path_resolved, ext.lower())
 
     replace_streams(args.src_hwp, args.dst_hwp, original_map)

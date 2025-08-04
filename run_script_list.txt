@@ -27,4 +27,4 @@
 
 # 6_replace_stream
 
-- python 6_replace_stream.py --map-json final_mapping.json --src-hwp "target_data/기계설비 성능점검 결과보고서(종합 1).hwp" --dst-hwp "target_data/기계설비 성능점검 결과보고서(종합 1)_수정본.hwp"
+- python 6_replace_stream.py --map-json mapping_result.json --src-hwp "target_data/기계설비 성능점검 결과보고서(종합 1).hwp" --dst-hwp "target_data/기계설비 성능점검 결과보고서(종합 1)_수정본.hwp"
