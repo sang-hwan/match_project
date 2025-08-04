@@ -19,12 +19,11 @@
 - python 4_A_verify_data.py --candidates candidates.json --mapping preprocess_mapping.json
 
 # 4_verify_mapping
-
-- python 4_verify_mapping.py --candidates candidates.json --mapping preprocess_mapping.json --img-root all_images_root --output mapping_result.json
+- python 4_verify_mapping.py -c candidates.json -m preprocess_mapping.json -i processed -o mapping_result.json -w 8
 
 # 5_check_map_result
 
-- python 5_check_map_result.py final_mapping.json images_output/ "target_data/자동등록 사진 모음" inspect_pairs/
+- python 5_check_map_result.py mapping_result.json images_output/ "target_data/자동등록 사진 모음" inspect_pairs/
 
 # 6_replace_stream
 
