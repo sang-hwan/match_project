@@ -38,9 +38,9 @@
 
 # 4_B_extract_threshold
 - python 4_B_extract_threshold.py \
-  --candidates-json path/to/candidates.json \
+  --candidates-json candidates.json \
   --images-root processed \
-  --labels-csv path/to/labels.csv \
+  --labels-csv hand_label.csv \
   --pos-mode top1 \
   --neg-mode hard \
   --target-tpr 0.97 \
@@ -56,9 +56,9 @@
 
 # 5_A_evaluate_mapping
 - python 5_A_evaluate_mapping.py \
-  --mapping-json path/to/mapping_result.json \
-  --scores-csv path/to/match_scores.csv \
-  --labels-csv path/to/labels.csv \
+  --mapping-json mapping_result.json \
+  --scores-csv match_scores.csv \
+  --labels-csv hand_label.csv \
   --suggest-n 20
 
 # 5_check_map_result
