@@ -110,16 +110,29 @@ def build_argparser() -> argparse.ArgumentParser:
     return ap
 
 
-def load_candidates(fp: Path, pos_mode: str) -> List[Tuple[str, str]]:
-    cand = json.loads(Path(fp).read_text())
-    pairs: List[Tuple[str, str]] = []
-    for origin_id, info in cand.items():
-        if not info['extracted_candidates']:
+def load_candidates(fp: Path, pos_mode: str):
+    data = json.loads(fp.read_text(encoding="utf-8"))
+
+    if isinstance(data, dict) and 'candidates' not in data:
+        pairs = []
+        for origin_id, info in data.items():
+            cand_list = info.get('extracted_candidates', [])
+            if not cand_list:
+                continue
+            if pos_mode == 'top1':
+                pairs.append((cand_list[0]['id'], origin_id))
+            else:
+                pairs.extend([(c['id'], origin_id) for c in cand_list])
+        return pairs
+
+    pairs = []
+    for item in data.get('candidates', []):
+        img_name = Path(item['name']).name
+        if '_BinData_' not in img_name:
             continue
-        if pos_mode == 'top1':
-            pairs.append((info['extracted_candidates'][0]['id'], origin_id))
-        else:
-            pairs.extend([(c['id'], origin_id) for c in info['extracted_candidates']])
+        ex_id  = img_name
+        origin = img_name.split('_BinData_', 1)[1]
+        pairs.append((ex_id, origin))
     return pairs
 
 
@@ -157,7 +170,7 @@ def main(args):
     logging.info(f'Positive pairs: {len(cand_pairs):,}')
 
     # Map IDs to file paths
-    meta = json.loads(Path('preprocess_mapping.json').read_text())
+    meta = json.loads(Path('preprocess_mapping.json').read_text(encoding="utf-8"))
     id2path = {k: str(Path(args.images_root) /
                       v['track'] / v['channel'] / k) for k, v in meta.items()}
 
