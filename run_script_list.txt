@@ -1,30 +1,75 @@
 # 1_ext_hwp_image
-
-- python 1_ext_hwp_image.py "target_data\기계설비 성능점검 결과보고서(종합 1).hwp" ./images_output
+- python 1_ext_hwp_image.py \
+  "target_data\기계설비 성능점검 결과보고서(종합 1).hwp" \
+  ./images_output
 
 # 2_pre_process_image
-
-- python 2_pre_process_image.py images_output/ processed/extracted "target_data/자동등록 사진 모음" processed/original --orig-root "target_data/자동등록 사진 모음" --low-size 640 --enable-high --min-pixels 10000 --colorspace lab --pad-mode replicate
+- python 2_pre_process_image.py \
+  images_output/ \
+  processed/extracted \
+  "target_data/자동등록 사진 모음" \
+  processed/original \
+  --orig-root "target_data/자동등록 사진 모음" \
+  --low-size 640 \
+  --enable-high \
+  --min-pixels 10000 \
+  --colorspace lab \
+  --pad-mode replicate
 
 # 3_A_search_threshold.py
-
-- python 3_A_search_threshold.py processed/extracted  processed/original --mapping preprocess_mapping.json
+- python 3_A_search_threshold.py \
+  processed/extracted \
+  processed/original \
+  --mapping preprocess_mapping.json
 
 # 3_mk_phash_candidates
-
-- python 3_mk_phash_candidates.py processed/extracted  processed/original candidates.json --mapping preprocess_mapping.json --phash-threshold 28 --hist-threshold 0.30
+- python 3_mk_phash_candidates.py \
+  processed/extracted \
+  processed/original \
+  candidates.json \
+  --mapping preprocess_mapping.json \
+  --phash-threshold 28 \
+  --hist-threshold 0.30
 
 # 4_A_verify_data
+- python 4_A_verify_data.py \
+  --candidates candidates.json \
+  --mapping preprocess_mapping.json
 
-- python 4_A_verify_data.py --candidates candidates.json --mapping preprocess_mapping.json
+# 4_B_extract_threshold
+- python 4_B_extract_threshold.py \
+  --candidates-json path/to/candidates.json \
+  --images-root processed \
+  --labels-csv path/to/labels.csv \
+  --pos-mode top1 \
+  --neg-mode hard \
+  --target-tpr 0.97 \
+  --threads 4
 
 # 4_verify_mapping
-- python 4_verify_mapping.py -c candidates.json -m preprocess_mapping.json -i processed -o mapping_result.json -w 8
+- python 4_verify_mapping.py \
+  -c candidates.json \
+  -m preprocess_mapping.json \
+  -i processed \
+  -o mapping_result.json \
+  -w 8
+
+# 5_A_evaluate_mapping
+- python 5_A_evaluate_mapping.py \
+  --mapping-json path/to/mapping_result.json \
+  --scores-csv path/to/match_scores.csv \
+  --labels-csv path/to/labels.csv \
+  --suggest-n 20
 
 # 5_check_map_result
-
-- python 5_check_map_result.py mapping_result.json images_output/ "target_data/자동등록 사진 모음" inspect_pairs/
+- python 5_check_map_result.py \
+  mapping_result.json \
+  images_output/ \
+  "target_data/자동등록 사진 모음" \
+  inspect_pairs/
 
 # 6_replace_stream
-
-- python 6_replace_stream.py --map-json mapping_result.json --src-hwp "target_data/기계설비 성능점검 결과보고서(종합 1).hwp" --dst-hwp "target_data/기계설비 성능점검 결과보고서(종합 1)_수정본.hwp"
+- python 6_replace_stream.py \
+  --map-json mapping_result.json \
+  --src-hwp "target_data/기계설비 성능점검 결과보고서(종합 1).hwp" \
+  --dst-hwp "target_data/기계설비 성능점검 결과보고서(종합 1)_수정본.hwp"

@@ -5,3 +5,8 @@ imagehash
 opencv-python
 numpy
 matplotlib
+pandas
+tqdm
+joblib
+scipy
+kneed
