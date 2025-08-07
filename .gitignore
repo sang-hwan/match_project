@@ -5,5 +5,7 @@
 /info_for_map
 /inspect_pairs
 /identity_dist
+/feat_dist
 *.json
 *.zip
+*.csv

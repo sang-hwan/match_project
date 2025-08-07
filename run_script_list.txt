@@ -46,10 +46,10 @@ python 4_B_extract_threshold.py `
     --candidates-json ".\candidates.json" `
     --images-root     ".\processed" `
     --labels-csv      ".\hand_label.csv" `
+    --out-dir         ".\feat_dist" `
     --pos-mode top1 `
     --neg-mode hard `
-    --target-tpr 0.97 `
-    --threads 4
+    --target-tpr 0.97
 
 
 # ───────────────────────── 4-C. 매핑 확정
