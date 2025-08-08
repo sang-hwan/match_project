@@ -1,3 +1,20 @@
+# ───────────────────────── 0-A. 디스크 캐시
+# (PowerShell 기준: 백틱 ` 으로 줄바꿈)
+python 0_A_cache_features.py `
+    ".\processed\extracted" `
+    ".\processed\reference" `
+    --mapping preprocess_mapping.json `
+    --out-dir .cache/features `
+    --which all --workers 8
+
+# 출력 구조
+.cache/features/
+  phash/{extracted|reference}/{low|high}/gray/<파일명>.txt       # 16자리 hex
+  hist/{extracted|reference}/{low|high}/color/<파일명>.npy       # (96,) float32
+  orb/{extracted|reference}/{low|high}/{gray|color}/<파일명>.npz # kps(N,2), des(N,32)
+  index.json                                                     # 처리 요약
+
+
 # ───────────────────────── 1. 이미지 추출
 python 1_ext_hwp_image.py `
     "target_data\기계설비 성능점검 결과보고서(종합 1).hwp" `
@@ -5,34 +22,33 @@ python 1_ext_hwp_image.py `
 
 
 # ───────────────────────── 2. 전처리
-python 2_pre_process_image.py `
-    ".\images_output" `
-    ".\processed\extracted" `
-    "target_data\자동등록 사진 모음" `
-    ".\processed\original" `
-    --orig-root "target_data\자동등록 사진 모음" `
-    --low-size 640 `
-    --enable-high `
-    --min-pixels 10000 `
-    --colorspace lab `
-    --pad-mode replicate
+python .\2_pre_process_image.py `
+  ".\images_output" `
+  ".\processed\extracted" `
+  ".\target_data\자동등록 사진 모음" `
+  ".\processed\reference" `
+  --ext-label extracted `
+  --ref-label reference `
+  --low-size 640 --enable-high --min-pixels 10000 --colorspace lab --pad-mode replicate
 
 
 # ───────────────────────── 3-A. 거리 분포 탐색
 python 3_A_search_threshold.py `
     ".\processed\extracted" `
-    ".\processed\original" `
+    ".\processed\reference" `
     --mapping preprocess_mapping.json
 
 
-# ───────────────────────── 3-B. 후보 생성(pHash·Hist)
-python 3_mk_phash_candidates.py `
-    ".\processed\extracted" `
-    ".\processed\original" `
-    ".\candidates.json" `
-    --mapping preprocess_mapping.json `
-    --phash-threshold 28 `
-    --hist-threshold 0.30
+# ───────────────────────── 3. 후보 생성(pHash·Hist)
+python .\3_mk_phash_candidates.py `
+  ".\processed\extracted" `
+  ".\processed\reference" `
+  ".\candidates.json" `
+  --mapping preprocess_mapping.json `
+  --phash-threshold 28 `
+  --hist-threshold 0.30 `
+  --cache-dir ".cache/features" `
+  --workers 8
 
 
 # ───────────────────────── 4-A. 무결성 검사
@@ -42,42 +58,48 @@ python 4_A_verify_data.py `
 
 
 # ───────────────────────── 4-B. ORB/RANSAC Threshold 추정
-python 4_B_extract_threshold.py `
-    --candidates-json ".\candidates.json" `
-    --images-root     ".\processed" `
-    --labels-csv      ".\hand_label.csv" `
-    --out-dir         ".\feat_dist" `
-    --pos-mode top1 `
-    --neg-mode hard `
-    --target-tpr 0.97
+python .\4_B_extract_threshold.py `
+  --candidates-json .\candidates.json `
+  --mapping .\preprocess_mapping.json `
+  --images-root .\processed `
+  --labels-csv .\hand_label.csv `
+  --out-dir .\feat_dist `
+  --pos-mode top1 `
+  --neg-mode hard `
+  --neg-ratio 1.0 `
+  --target-tpr 0.97
 
 
-# ───────────────────────── 4-C. 매핑 확정
-python 4_verify_mapping.py `
-    -c ".\candidates.json" `
-    -m preprocess_mapping.json `
-    -i ".\processed" `
-    -o "mapping_result.json" `
-    -w 8
+# ───────────────────────── 4. 매핑 확정
+python .\4_verify_mapping.py `
+  -c .\candidates.json `
+  -m .\preprocess_mapping.json `
+  -i .\processed `
+  -o .\mapping_result.json `
+  --scores-csv .\pair_scores.csv `
+  --thresholds .\feat_dist\thresholds.json `
+  --workers 8
 
 
 # ───────────────────────── 5-A. 정량 평가
-python 5_A_evaluate_mapping.py `
-    --mapping-json "mapping_result.json" `
-    --scores-csv   "match_scores.csv" `
-    --labels-csv   "hand_label.csv" `
-    --suggest-n    20
+python .\5_A_evaluate_mapping.py `
+  --mapping-json .\mapping_result.json `
+  --scores-csv   .\feat_dist\match_scores.csv `
+  --labels-csv   .\hand_label.csv `
+  --suggest-n    20
 
 
-# ───────────────────────── 5-B. 육안 검수용 복사
-python 5_check_map_result.py `
-    "mapping_result.json" `
-    ".\images_output" `
-    "target_data\자동등록 사진 모음" `
-    ".\inspect_pairs"
+# ───────────────────────── 5. 육안 검수용 복사
+python .\5_check_map_result.py `
+  ".\mapping_result.json" `
+  ".\images_output" `
+  ".\target_data\자동등록 사진 모음" `
+  ".\inspect_pairs" `
+  --export-csv .\inspect_pairs\manifest.csv
 
 
 # ───────────────────────── 6. HWP 스트림 교체
+# (코드상 인자명: --map-json / --src-hwp / --dst-hwp)
 python 6_replace_stream.py `
     --map-json "mapping_result.json" `
     --src-hwp  "target_data\기계설비 성능점검 결과보고서(종합 1).hwp" `

@@ -1,201 +1,335 @@
 # 4_B_extract_threshold.py
-"""ORB + RANSAC threshold estimator for the HWP-image matching project.
+"""
+ORB + RANSAC 임계값 추정기 (간소화 버전)
 
-Images live in the following **fixed** structure (all PNG):
+- 입력: candidates.json, preprocess_mapping.json, (옵션) hand_label.csv
+- 출력: outputs/match_scores.csv, outputs/thresholds.json, orb_hist.png, orb_cdf.png
 
-processed/extracted/{low|high}/{gray|color}/<추출 PNG>
-processed/original/{low|high}/{gray|color}/<원본 PNG>
-
-PowerShell example
-------------------
-python 4_B_extract_threshold.py `
-    --candidates-json ".\\candidates.json" `
-    --images-root     ".\\processed" `
-    --out-dir         ".\\outputs"
+예)
+python 4_B_extract_threshold.py ^
+  --candidates-json candidates.json ^
+  --mapping preprocess_mapping.json ^
+  --images-root processed ^
+  --out-dir outputs ^
+  --pos-mode top1 ^
+  --neg-mode hard ^
+  --neg-ratio 1.0
 """
 
-from __future__ import annotations
-import argparse, json, os, random
-from pathlib import Path, PureWindowsPath
+import argparse
+import json
+import os
+import random
+from pathlib import Path
 from typing import Dict, List, Tuple
 
-import cv2, numpy as np, pandas as pd, matplotlib.pyplot as plt
+import cv2
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 from joblib import Memory
 from tqdm import tqdm
 from scipy.stats import beta
-from kneed import KneeLocator
 
-# ───────────────────────── cache ────────────────────────────
+# 선택 의존성: 없으면 분위수로 폴백
+try:
+    from kneed import KneeLocator  # type: ignore
+except Exception:
+    KneeLocator = None
+
+cv2.setNumThreads(0)
 CACHE = Memory(".cache/descriptors", verbose=0)
 
-# ───────────────────── helper: robust imread ────────────────
-def _safe_imread(p: str, flag=cv2.IMREAD_GRAYSCALE):
-    if not os.path.exists(p):
+# ─────────────── I/O & 경로 ───────────────
+def norm_identity(p: str) -> str:
+    return os.path.normpath(p).lower()
+
+def safe_imread(path: str, flag=cv2.IMREAD_GRAYSCALE):
+    if not os.path.exists(path):
         return None
-    img = cv2.imread(p, flag)
+    img = cv2.imread(path, flag)
     if img is not None:
         return img
     try:
-        buf = np.fromfile(p, np.uint8)
+        buf = np.fromfile(path, dtype=np.uint8)
         return cv2.imdecode(buf, flag)
     except Exception:
         return None
 
-
+# ─────────────── ORB + RANSAC ───────────────
 @CACHE.cache
-def _extract_orb(path: str, n=1500):
-    img = _safe_imread(path)
+def extract_orb(path: str, n: int = 1500):
+    img = safe_imread(path, cv2.IMREAD_GRAYSCALE)
     if img is None:
-        raise FileNotFoundError(path)
+        return np.empty((0, 2), dtype=np.float32), None
     orb = cv2.ORB_create(nfeatures=n)
     kps, des = orb.detectAndCompute(img, None)
-    return np.float32([kp.pt for kp in kps]), des
+    pts = np.float32([kp.pt for kp in kps]) if kps else np.empty((0, 2), dtype=np.float32)
+    return pts, des
 
-
-def _orb_score(a: str, b: str, ratio=0.75) -> Tuple[int, int, int]:
-    ptsA, desA = _extract_orb(a); ptsB, desB = _extract_orb(b)
-    if desA is None or desB is None:
+def orb_score(a: str, b: str, nfeatures: int = 1500, ratio: float = 0.75, ransac_thresh: float = 5.0) -> Tuple[int, int, int]:
+    ptsA, desA = extract_orb(a, n=nfeatures)
+    ptsB, desB = extract_orb(b, n=nfeatures)
+    if desA is None or desB is None or len(desA) == 0 or len(desB) == 0:
         return 0, len(ptsA), len(ptsB)
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING)
-    good = [m for m, n in bf.knnMatch(desA, desB, 2)
-            if m.distance < ratio * n.distance]
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    matches = bf.knnMatch(desA, desB, k=2)
+    good = [m for m, n in matches if n is not None and m.distance < ratio * n.distance]
     if len(good) < 4:
         return 0, len(ptsA), len(ptsB)
+
     src = np.float32([ptsA[m.queryIdx] for m in good])
     dst = np.float32([ptsB[m.trainIdx] for m in good])
-    _, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+    _, mask = cv2.findHomography(src, dst, cv2.RANSAC, ransac_thresh)
     inl = int(mask.sum()) if mask is not None else 0
     return inl, len(ptsA), len(ptsB)
 
+def knee_or_quantile(values: List[float], q: float = 0.97) -> float:
+    if not values:
+        return 0.0
+    xs = sorted(values)
+    if KneeLocator is not None and len(xs) >= 10:
+        cdf = np.linspace(0, 1, len(xs))
+        try:
+            k = KneeLocator(xs, cdf, curve="concave", direction="increasing")
+            if k.knee is not None:
+                return float(k.knee)
+        except Exception:
+            pass
+    return float(np.quantile(xs, q))
 
-def _knee(values: List[float]) -> float:
-    cdf = np.linspace(0, 1, len(values))
-    k = KneeLocator(values, cdf, curve="concave", direction="increasing")
-    return float(k.knee) if k.knee else float(np.quantile(values, 0.97))
+# ─────────────── 매핑/전처리 선택 ───────────────
+def build_lookup(pre_map: Dict, images_root: Path) -> Dict[str, Dict[Tuple[str, str, str], str]]:
+    """
+    identity(원본 풀 경로 정규화) -> {(category, track, channel): relative processed path}
+    """
+    lut: Dict[str, Dict[Tuple[str, str, str], str]] = {}
+    for proc_name, meta in pre_map.items():
+        origin = meta.get("원본_전체_경로", "")
+        track = str(meta.get("트랙", "")).lower()
+        ch = str(meta.get("채널", "")).lower()
+        cat = "extracted" if "BinData" in origin else "original"
+        rel = f"{cat}/{track}/{ch}/{proc_name}"
+        lut.setdefault(norm_identity(origin), {})[(cat, track, ch)] = rel
+    return lut
 
+def pick_preprocessed(identity_path: str, track: str, prefer_gray: bool,
+                      lut: Dict[str, Dict[Tuple[str, str, str], str]], images_root: Path) -> str:
+    """
+    동일 identity 내에서 (category 동일 → track 동일 → 채널 선호) 우선, 없으면 원본 경로 사용.
+    """
+    key = norm_identity(identity_path)
+    options = lut.get(key, {})
+    if not options:
+        return identity_path
 
-# ───────────────────────── CLI ──────────────────────────────
-def _argparser():
-    ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    order = ["gray", "color"] if prefer_gray else ["color", "gray"]
+    cat = "extracted" if "BinData" in identity_path else "original"
+
+    for ch in order:
+        tup = (cat, track, ch)
+        if tup in options:
+            return str(images_root / options[tup])
+
+    for (c2, t2, ch2), rel in options.items():
+        if t2 == track and ch2 in order:
+            return str(images_root / rel)
+
+    return identity_path
+
+# ─────────────── 페어 구성 ───────────────
+def load_positive_pairs(cand_json: Dict, mode: str = "top1") -> List[Tuple[str, str, str]]:
+    """
+    candidates.json → [(extracted_identity, original_identity, track)]
+    """
+    pos: List[Tuple[str, str, str]] = []
+    for origin_path, info in cand_json.items():
+        track = str(info.get("track", "low")).lower()
+        items = info.get("candidates", info.get("extracted_candidates", [])) or []
+        chosen = [items[0]] if (mode == "top1" and items) else items
+        for c in chosen:
+            name = c.get("name")
+            if not name:
+                continue
+            a, b = origin_path, name
+            if ("BinData" in a) == ("BinData" in b):
+                continue
+            ex = a if "BinData" in a else b
+            ori = b if "BinData" not in b else a
+            pos.append((ex, ori, track))
+    return pos
+
+def sample_negatives(pos_pairs: List[Tuple[str, str, str]], ratio: float = 1.0,
+                     mode: str = "hard", seed: int = 0) -> List[Tuple[str, str, str]]:
+    rng = random.Random(seed)
+    ex_ids = sorted({ex for ex, _, _ in pos_pairs})
+    or_ids = sorted({ori for _, ori, _ in pos_pairs})
+    ex2tracks: Dict[str, List[str]] = {}
+    for ex, _, tr in pos_pairs:
+        ex2tracks.setdefault(ex, [])
+        if tr not in ex2tracks[ex]:
+            ex2tracks[ex].append(tr)
+
+    pos_set = {(ex, ori) for ex, ori, _ in pos_pairs}
+    need = int(len(pos_pairs) * ratio)
+    mult = 3 if mode == "hard" else 1
+    cand: List[Tuple[str, str, str]] = []
+
+    while len(cand) < need * mult and ex_ids and or_ids:
+        ex = rng.choice(ex_ids)
+        ori = rng.choice(or_ids)
+        if (ex, ori) in pos_set:
+            continue
+        tr = rng.choice(ex2tracks.get(ex, ["low"]))
+        cand.append((ex, ori, tr))
+
+    uniq = list(dict.fromkeys(cand))
+    return uniq[:need]
+
+# ─────────────── CLI ───────────────
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description="Estimate ORB+RANSAC threshold from candidates & preprocessed images",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     ap.add_argument("--candidates-json", required=True)
+    ap.add_argument("--mapping", default="preprocess_mapping.json")
     ap.add_argument("--images-root", default="processed")
-    ap.add_argument("--labels-csv", default=None)
     ap.add_argument("--out-dir", default="outputs")
+    ap.add_argument("--labels-csv", default=None,
+                    help="CSV columns: orig_path, extracted_path, label(1/0)")
     ap.add_argument("--pos-mode", choices=["top1", "all"], default="top1")
     ap.add_argument("--neg-mode", choices=["shuffle", "hard"], default="hard")
+    ap.add_argument("--neg-ratio", type=float, default=1.0)
     ap.add_argument("--target-tpr", type=float, default=0.97)
-    return ap
+    ap.add_argument("--orb-nfeatures", type=int, default=1500)
+    ap.add_argument("--lowe-ratio", type=float, default=0.75)
+    ap.add_argument("--ransac-thresh", type=float, default=5.0)
+    ap.add_argument("--seed", type=int, default=0)
+    return ap.parse_args()
 
+# ─────────────── Main ───────────────
+def main():
+    args = parse_args()
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
 
-# ────────────────────── data helpers ────────────────────────
-def _load_candidates(fp: Path, mode: str):
-    js = json.loads(fp.read_text("utf-8")); pairs = []
-    for orig_path, info in js.items():
-        cands = info.get("candidates", info.get("extracted_candidates", []))
-        if not cands:
-            continue
-        orig = PureWindowsPath(orig_path).name
-        if mode == "top1":
-            pairs.append((PureWindowsPath(cands[0]["name"]).name, orig))
-        else:
-            pairs += [(PureWindowsPath(c["name"]).name, orig) for c in cands]
-    return pairs
+    cand_json = json.loads(Path(args.candidates_json).read_text("utf-8"))
+    pre_map = json.loads(Path(args.mapping).read_text("utf-8"))
+    images_root = Path(args.images_root)
 
+    lut = build_lookup(pre_map, images_root)
+    pos = load_positive_pairs(cand_json, args.pos_mode)
+    neg = sample_negatives(pos, ratio=args.neg_ratio, mode=args.neg_mode, seed=args.seed)
+    print(f"[INFO] positives: {len(pos):,} , negatives: {len(neg):,}")
 
-def _negatives(pos, ids, mode="hard", ratio=1.0):
-    pos_set, neg, rng = set(pos), [], random.Random(0)
-    mult = 3 if mode == "hard" else 1
-    while len(neg) < int(len(pos) * ratio * mult):
-        a, b = rng.sample(ids, 2)
-        if (a, b) not in pos_set:
-            neg.append((a, b))
-    return neg[: int(len(pos) * ratio)]
+    rows: List[Dict] = []
+    miss = 0
+    all_pairs = [("P",) + p for p in pos] + [("N",) + p for p in neg]
+    random.Random(args.seed).shuffle(all_pairs)
 
-
-# ────────────────────── path mapping ────────────────────────
-def _build_paths(meta: dict, root: str) -> Dict[str, str]:
-    id2path: Dict[str, str] = {}
-    for img_id, row in meta.items():
-        track, ch = row["트랙"], row["채널"]
-        # 추출 전처리본
-        id2path[img_id] = str(Path(root, "extracted", track, ch, img_id))
-        # 대응되는 원본 전처리본(있으면) 또는 RAW
-        oname = Path(row["원본_전체_경로"]).name
-        p_orig = Path(root, "original", track, ch, oname)
-        id2path.setdefault(oname, str(p_orig if p_orig.exists() else row["원본_전체_경로"]))
-    return id2path
-
-
-# ───────────────────────── main ─────────────────────────────
-def main(a):
-    out = Path(a.out_dir); out.mkdir(parents=True, exist_ok=True)
-
-    pos = _load_candidates(Path(a.candidates_json), a.pos_mode)
-    print(f"[INFO] positives: {len(pos):,}")
-
-    meta = json.loads(Path("preprocess_mapping.json").read_text("utf-8"))
-    id2path = _build_paths(meta, a.images_root)
-    print(f"[INFO] mapping entries: {len(id2path):,}")
-
-    # 추가 id 확보(candidates 내 절대경로)
-    raw = json.loads(Path(a.candidates_json).read_text("utf-8"))
-    for o, v in raw.items():
-        id2path.setdefault(PureWindowsPath(o).name, o)
-        for c in v.get("candidates", v.get("extracted_candidates", [])):
-            id2path.setdefault(PureWindowsPath(c["name"]).name, c["name"])
-
-    neg = _negatives(pos, list(id2path), a.neg_mode)
-    print(f"[INFO] negatives: {len(neg):,}")
-
-    pairs = [("P",)+p for p in pos] + [("N",)+p for p in neg]
-    random.shuffle(pairs)
-
-    rows, miss = [], 0
-    for lb, ex, ori in tqdm(pairs, ncols=80, desc="ORB"):
-        pa, pb = id2path[ex], id2path[ori]
+    for label, ex_id, or_id, track in tqdm(all_pairs, ncols=80, desc="ORB"):
+        ex_path = pick_preprocessed(ex_id, track, True, lut, images_root)
+        or_path = pick_preprocessed(or_id, track, True, lut, images_root)
         try:
-            inl, kA, kB = _orb_score(pa, pb)
-        except FileNotFoundError:
-            miss += 1; continue
-        rows.append(dict(label=lb, ex_id=ex, or_id=ori,
-                         inliers=inl, kpA=kA, kpB=kB,
-                         score=inl/(kA+1e-6)))
+            inl, kA, kB = orb_score(
+                ex_path, or_path,
+                nfeatures=args.orb_nfeatures,
+                ratio=args.lowe_ratio,
+                ransac_thresh=args.ransac_thresh,
+            )
+        except Exception:
+            miss += 1
+            continue
+
+        score = inl / (kA + 1e-6)
+        rows.append(dict(
+            label=label,
+            ex_id=Path(ex_id).name, or_id=Path(or_id).name,
+            ex_path=ex_id, or_path=or_id,
+            ex_used=str(ex_path), or_used=str(or_path),
+            track=track,
+            inliers=inl, kpA=kA, kpB=kB, score=float(score),
+        ))
+
     print(f"[INFO] file-read failures: {miss}")
     df = pd.DataFrame(rows)
-    df.to_csv(out/"match_scores.csv", index=False)
-    print(f"[INFO] ORB rows: {len(df):,}")
+    df.to_csv(out / "match_scores.csv", index=False, encoding="utf-8-sig")
+    print(f"[SAVE] {out / 'match_scores.csv'}  rows={len(df):,}")
 
-    scores, ssorted = df["score"].tolist(), sorted(df["score"])
-    if a.labels_csv:
-        lab = pd.read_csv(a.labels_csv, encoding="utf-8-sig")
-        lmap = {(Path(r.extracted_path).name, Path(r.orig_path).name): r.label
-                for r in lab.itertuples(index=False)}
-        y = [1 if lmap.get((r.ex_id, r.or_id), 0)==1 else 0
-             for r in df.itertuples(index=False)]
-        tp, fn = sum(y), len(y)-sum(y)
-        thr = next((t for t in np.linspace(0,1,101)
-                    if (sum((s>=t and y[i]) for i,s in enumerate(scores))+1)/(tp+2)
-                    >= a.target_tpr), 0.0)
-        thr_dict = dict(orb_score=thr,
-                        ci_low=beta.ppf(.025,tp+1,fn+1),
-                        ci_high=beta.ppf(.975,tp+1,fn+1))
-    else:
-        thr_dict = dict(orb_score=_knee(ssorted),
-                        ci_low=None, ci_high=None)
+    # ── 임계값 ──
+    thr_info: Dict[str, float | None] = {"orb_score": None, "ci_low": None, "ci_high": None}
 
-    (out/"thresholds.json").write_text(json.dumps(thr_dict, indent=2, ensure_ascii=False))
-    print(f"[KEY] threshold = {thr_dict['orb_score']:.4f}")
+    if args.labels_csv and Path(args.labels_csv).is_file():
+        lab = pd.read_csv(args.labels_csv, encoding="utf-8-sig")
+        cols = {c.lower(): c for c in lab.columns}
+        ocol = cols.get("orig_path", cols.get("orig"))
+        ecol = cols.get("extracted_path", cols.get("extracted"))
+        lcol = cols.get("label", cols.get("y"))
+        if not (ocol and ecol and lcol):
+            raise ValueError("labels-csv must contain columns: orig_path/extracted_path/label")
+        lab = lab.rename(columns={ocol: "orig", ecol: "extracted", lcol: "label"})
+        lab["orig_b"] = lab["orig"].apply(lambda s: Path(str(s)).name)
+        lab["extr_b"] = lab["extracted"].apply(lambda s: Path(str(s)).name)
 
-    plt.figure(); plt.hist(ssorted,100,log=True)
-    plt.title("ORB score histogram"); plt.xlabel("score"); plt.ylabel("freq(log)")
-    plt.savefig(out/"orb_hist.png", dpi=150)
+        d2 = df.copy()
+        d2["orig_b"] = d2["or_id"]
+        d2["extr_b"] = d2["ex_id"]
+        merged = d2.merge(lab[["orig_b", "extr_b", "label"]], on=["orig_b", "extr_b"], how="left")
+        merged["label"] = merged["label"].fillna(-1).astype(int)
+        labeled = merged[merged["label"] >= 0].copy()
 
-    plt.figure(); plt.plot(ssorted, np.linspace(0,1,len(ssorted)))
-    plt.axvline(thr_dict["orb_score"], color="r", ls="--")
-    plt.title("ORB score CDF"); plt.xlabel("score"); plt.ylabel("CDF")
-    plt.savefig(out/"orb_cdf.png", dpi=150)
-    print("Done.")
+        if labeled.empty:
+            print("[WARN] no labeled pairs matched; falling back to no-label mode.")
+        else:
+            y = (labeled["label"] == 1).astype(int).values
+            s = labeled["score"].values
+            thr = None
+            for t in np.linspace(0, 1, 101):
+                tp = int(((s >= t) & (y == 1)).sum())
+                fn = int((y == 1).sum()) - tp
+                tpr = (tp + 1) / (tp + fn + 2)  # Laplace smoothing
+                if tpr >= args.target_tpr:
+                    ci_low = beta.ppf(0.025, tp + 1, fn + 1)
+                    ci_high = beta.ppf(0.975, tp + 1, fn + 1)
+                    thr_info = {"orb_score": float(t), "ci_low": float(ci_low), "ci_high": float(ci_high)}
+                    thr = t
+                    break
+            if thr is None:
+                tp = int((y == 1).sum())
+                fallback = float(np.quantile(s[y == 1], 0.05)) if (y == 1).any() else 0.0
+                thr_info = {
+                    "orb_score": fallback,
+                    "ci_low": float(beta.ppf(0.025, 1, max(tp, 1))),
+                    "ci_high": float(beta.ppf(0.975, 1, max(tp, 1))),
+                }
 
+    if thr_info["orb_score"] is None:
+        pos_scores = df.loc[df["label"] == "P", "score"].tolist()
+        thr_info = {"orb_score": knee_or_quantile(pos_scores, q=0.97), "ci_low": None, "ci_high": None}
+
+    (out / "thresholds.json").write_text(json.dumps(thr_info, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"[KEY] threshold = {thr_info['orb_score']:.4f}")
+
+    # ── 플롯 ──
+    plt.figure()
+    plt.hist(df["score"].tolist(), bins=100, log=True)
+    plt.xlabel("score (inliers / keypointsA)")
+    plt.ylabel("freq (log)")
+    plt.tight_layout()
+    plt.savefig(out / "orb_hist.png", dpi=150)
+
+    xs = sorted(df["score"].tolist())
+    plt.figure()
+    plt.plot(xs, np.linspace(0, 1, len(xs)))
+    plt.axvline(float(thr_info["orb_score"]), ls="--")
+    plt.xlabel("score")
+    plt.ylabel("CDF")
+    plt.tight_layout()
+    plt.savefig(out / "orb_cdf.png", dpi=150)
+
+    print("[DONE] analysis complete.")
 
 if __name__ == "__main__":
-    main(_argparser().parse_args())
+    main()
