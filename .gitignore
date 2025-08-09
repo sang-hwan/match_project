@@ -6,6 +6,7 @@
 /inspect_pairs
 /identity_dist
 /feat_dist
+/.cache
 *.json
 *.zip
 *.csv

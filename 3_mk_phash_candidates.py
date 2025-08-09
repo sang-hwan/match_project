@@ -8,19 +8,25 @@ pHash + HSV 히스토그램 기반 후보군 생성 (CPU-only)
     reference/{low|high}/{gray|color}/<name>.png
   preprocess_mapping.json  (키: '트랙','채널','카테고리','원본_전체_경로')
 
-출력:
-  out_json (candidates.json 유사 포맷):
-    { "<원본_전체_경로>": { "track": "low|high",
-                            "candidates": [{ "name": "<원본_전체_경로>",
-                                             "phash": <int>,
-                                             "hist": <float> }, ...] }, ... }
+출력 (기본: 트랙 분리 키, low/high 혼합 방지):
+  out_json:
+    {
+      "low|<원본_전체_경로>": {
+        "original_path": "<원본_전체_경로>",
+        "track": "low",
+        "candidates": [
+          {"name": "<원본_전체_경로>", "phash": <int>, "hist": <float>},
+          ...
+        ]
+      },
+      "high|<원본_전체_경로>": { ... }
+    }
 
-사용 예:
+CLI 예:
   python 3_mk_phash_candidates.py processed/extracted processed/reference out/candidates.json \
-         --mapping preprocess_mapping.json --phash-threshold 38 --hist-threshold 0.81 \
-         --cache-dir .cache/features --workers 8
+         --mapping preprocess_mapping.json --phash-threshold 28 --hist-threshold 0.30 \
+         --cache-dir .cache/features --workers 8 [--key-mode track_path|path] [--no-dedup-within-basis]
 """
-
 from __future__ import annotations
 
 import sys
@@ -64,8 +70,8 @@ def _normalize_category(cat: str | None, origin_path: str | None) -> str:
 class FSCache:
     """
     0_A_cache_features.py가 만든 디렉터리 캐시 사용:
-      phash/<cat>/<track>/gray/<name>.txt  (16-hex)
-      hist/<cat>/<track>/color/<name>.npy  (96D float32)
+      phash/{extracted|reference}/{low|high}/gray/<name>.txt  (16-hex)
+      hist/{extracted|reference}/{low|high}/color/<name>.npy  (96D float32)
     없으면 즉시 계산으로 대체.
     """
     def __init__(self, base: Path, ex_root: Path, ref_root: Path):
@@ -81,31 +87,45 @@ class FSCache:
             return "extracted", rel.parts[0], rel.parts[1], name
         except Exception:
             pass
-        rel = p.resolve().relative_to(self.ref_root.resolve())
-        return "reference", rel.parts[0], rel.parts[1], name
+        try:
+            rel = p.resolve().relative_to(self.ref_root.resolve())
+            return "reference", rel.parts[0], rel.parts[1], name
+        except Exception:
+            pass
+        raise ValueError(f"unknown root: {p}")
 
+    # ----- pHash -----
     def get_phash(self, p: Path) -> imagehash.ImageHash:
-        from imagehash import hex_to_hash
-        cat, track, _ch, name = self._rel_info(p)
-        f = self.base / "phash" / cat / track / "gray" / (name + ".txt")
-        if f.is_file():
-            try:
-                return hex_to_hash(f.read_text(encoding="utf-8").strip())
-            except Exception:
-                pass
-        # fallback compute
+        cat, track, ch, name = self._rel_info(p)
+        if ch != "gray":
+            raise ValueError("pHash는 gray 채널만 지원")
+        cfile = self.base / "phash" / cat / track / ch / (name + ".txt")
+        try:
+            with open(cfile, "r", encoding="utf-8") as f:
+                return imagehash.hex_to_hash(f.read().strip())
+        except Exception:
+            pass
         with Image.open(p) as im:
-            return imagehash.phash(im)
+            h = imagehash.phash(ImageOps.exif_transpose(im))
+        try:
+            cfile.parent.mkdir(parents=True, exist_ok=True)
+            with open(cfile, "w", encoding="utf-8") as f:
+                f.write(str(h))
+        except Exception:
+            pass
+        return h
 
+    # ----- HSV hist (color) -----
     def get_hist(self, p: Path) -> np.ndarray:
-        cat, track, _ch, name = self._rel_info(p)
-        f = self.base / "hist" / cat / track / "color" / (name + ".npy")
-        if f.is_file():
-            try:
-                v = np.load(f)
-                return np.asarray(v, dtype="float32").reshape(-1)
-            except Exception:
-                pass
+        cat, track, ch, name = self._rel_info(p)
+        if ch != "color":
+            raise ValueError("HSV hist는 color 채널만 지원")
+        cfile = self.base / "hist" / cat / track / ch / (name + ".npy")
+        try:
+            v = np.load(cfile)
+            return np.asarray(v, dtype="float32").reshape(-1)
+        except Exception:
+            pass
         # fallback compute
         with Image.open(p) as im:
             im = ImageOps.exif_transpose(im)
@@ -113,9 +133,9 @@ class FSCache:
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         feats = []
         for c in range(3):
-            h = cv2.calcHist([hsv], [c], None, [32], [0, 256])
-            cv2.normalize(h, h)
-            feats.append(h.flatten())
+            hist = cv2.calcHist([hsv], [c], None, [32], [0, 256])
+            cv2.normalize(hist, hist)
+            feats.append(hist.flatten())
         return np.concatenate(feats).astype("float32")
 
 
@@ -135,15 +155,13 @@ def _batch_phash(paths: List[Path], cache: FSCache, workers: int) -> Dict[Path, 
                     with Image.open(p) as im:
                         out[p] = imagehash.phash(im)
                 except Exception:
-                    # skip unreadable
-                    pass
+                    pass  # skip unreadable
     return out
 
 
 def _batch_hist(paths: List[Path], cache: FSCache, workers: int) -> Dict[str, np.ndarray]:
     """
     반환: basename -> 96D float32.
-    preprocess_mapping.json의 키가 파일명 기준이므로 basename으로 맞춘다.
     """
     out: Dict[str, np.ndarray] = {}
     if not paths:
@@ -184,7 +202,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hist-threshold", type=float, default=0.81)
     p.add_argument("--cache-dir", default=".cache/features", help="filesystem feature cache root")
     p.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
+    p.add_argument("--key-mode", choices=["track_path","path"], default="track_path",
+                   help='basis key: "track|<원본_전체_경로>" (default) or "<원본_전체_경로>" (legacy, not recommended)')
+    p.add_argument("--dedup-within-basis", dest="dedup_within_basis", action="store_true", default=True,
+                   help="basis 내 동일 candidate name은 (min hist, then min phash) 기준으로 1개만 유지")
+    p.add_argument("--no-dedup-within-basis", dest="dedup_within_basis", action="store_false")
     return p.parse_args()
+
+
+# ---- Key utility ----
+def _make_basis_id(mid: str, track: str, mode: str) -> str:
+    """Return unique basis ID. Default: "track|<원본_전체_경로>" to avoid low/high collapsing."""
+    if mode == "path":
+        return mid
+    return f"{track}|{mid}"
 
 
 # ---- Main ----
@@ -203,6 +234,8 @@ def main() -> None:
         "hist_threshold": args.hist_threshold,
         "cache_dir": args.cache_dir,
         "workers": args.workers,
+        "key_mode": args.key_mode,
+        "dedup_within_basis": args.dedup_within_basis,
     })
 
     # 매핑 로드 (단일 진실원)
@@ -256,22 +289,40 @@ def main() -> None:
         h_basis = _batch_phash(basis_gray, cache, args.workers)
         h_compare = _batch_phash(compare_gray, cache, args.workers)
 
-        # 비교측 컬러 히스토그램(파일명/그레이동명이름 키)
+        # --- 핵심 수정: compare_gray → 정확한 color 파일명 역추적 후 히스토그램 구축 ---
+        needed_color_files: List[Path] = []
+        gray_to_color: Dict[str, str] = {}  # gray파일명 -> color파일명
+
+        for gp in compare_gray:  # gp.name 예: 000123_g.png
+            meta = mp.get(gp.name)
+            if not meta:
+                continue
+            cid = meta.get("원본_전체_경로")
+            if not cid:
+                continue
+            cname = id2name.get((cid, track, "color"))  # 대응 color 파일명 (예: 000123.png)
+            if not cname:
+                continue
+            needed_color_files.append(compare_color_dir / cname)
+            gray_to_color[gp.name] = cname
+
+        color_hists = _batch_hist(needed_color_files, cache, args.workers)  # key: color파일명 -> 벡터
+
+        # gray·color 양쪽 키로 조회 가능하도록 사전 구성
         hist_compare: Dict[str, np.ndarray] = {}
-        if compare_color_dir.is_dir():
-            color_files = [p for p in compare_color_dir.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
-            color_hists = _batch_hist(color_files, cache, args.workers)
-            for c_name, hv in color_hists.items():
-                hist_compare[c_name] = hv
-                meta = mp.get(c_name)
-                if meta:
-                    gname = id2name.get((meta["원본_전체_경로"], track, "gray"))
-                    if gname:
-                        hist_compare[gname] = hv
-        else:
-            print(f"[WARN] Missing color dir: {compare_color_dir} — histogram step will be sparse.")
+        for gname, cname in gray_to_color.items():
+            hv = color_hists.get(cname)
+            if hv is not None:
+                hist_compare[gname] = hv   # cp.name(=gray)로 조회
+                hist_compare[cname] = hv   # 필요시 color명으로도 조회
+
+        print(f"[HIST] {track}: compare_gray={len(compare_gray)}  map_ok={len(gray_to_color)}  "
+              f"hist_vecs={len(color_hists)}")
 
         # 기준 이미지별 후보 탐색
+        track_phash_pass = 0
+        track_hist_pass = 0
+
         for bpath, bhash in h_basis.items():
             basis_cnt += 1
 
@@ -280,9 +331,10 @@ def main() -> None:
                 continue
             mid = b_meta["원본_전체_경로"]
 
-            entry = out.setdefault(mid, {"track": track, "candidates": []})
+            basis_id = _make_basis_id(mid, track, args.key_mode)
+            entry = out.setdefault(basis_id, {"track": track, "original_path": mid, "candidates": []})
 
-            # 기준의 컬러 히스토그램
+            # 기준(color) 히스토그램
             c_name = id2name.get((mid, track, "color"))
             if not c_name:
                 continue
@@ -298,14 +350,18 @@ def main() -> None:
                 try:
                     d = int(bhash - chash)
                 except Exception:
-                    with Image.open(cp) as im:
-                        d = int(bhash - imagehash.phash(im))
+                    try:
+                        with Image.open(cp) as im:
+                            d = int(bhash - imagehash.phash(im))
+                    except Exception:
+                        continue
                 pdists.append((cp, d))
             pdists.sort(key=lambda x: x[1])
 
             for cp, pdist in pdists:
                 if pdist > args.phash_threshold:
                     break
+                track_phash_pass += 1
 
                 c_meta = mp.get(cp.name)
                 if not c_meta:
@@ -316,16 +372,38 @@ def main() -> None:
                 if cand_id == mid:
                     continue
 
+                # 히스토그램 조회 (gray 이름 우선 → color 이름 백업)
                 hvec = hist_compare.get(cp.name)
                 if hvec is None:
-                    continue
+                    cname = id2name.get((cand_id, track, "color"))
+                    if cname:
+                        hvec = hist_compare.get(cname)
+                if hvec is None:
+                    continue  # 여전히 없으면 스킵
 
                 hdist = float(cv2.compareHist(basis_hist, hvec, cv2.HISTCMP_BHATTACHARYYA))
-                if hdist <= args.hist_threshold:
-                    entry["candidates"].append(
-                        {"name": cand_id, "phash": int(pdist), "hist": round(hdist, 4)}
-                    )
+                if hdist > args.hist_threshold:
+                    continue
+                track_hist_pass += 1
+
+                new_c = {"name": cand_id, "phash": int(pdist), "hist": round(hdist, 4)}
+                if args.dedup_within_basis:
+                    # dedup by candidate name; keep best (min hist, then min phash)
+                    replaced = False
+                    for i, _c in enumerate(entry["candidates"]):
+                        if _c["name"] == cand_id:
+                            if (new_c["hist"], new_c["phash"]) < (_c["hist"], _c["phash"]):
+                                entry["candidates"][i] = new_c
+                            replaced = True
+                            break
+                    if not replaced:
+                        entry["candidates"].append(new_c)
+                        cand_cnt += 1
+                else:
+                    entry["candidates"].append(new_c)
                     cand_cnt += 1
+
+        print(f"[PASS] {track}: pHash_pass={track_phash_pass:,}  hist_pass={track_hist_pass:,}")
 
     # 저장
     Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
