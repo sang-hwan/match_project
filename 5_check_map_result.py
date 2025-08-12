@@ -1,209 +1,209 @@
 # 5_check_map_result.py
 """
-Collect mapped pairs into one folder for quick visual check.
+매핑 결과 페어 수집/시각 점검용 스크립트 (견고화 버전)
 
-Usage (RAW):
-  python 5_check_map_result.py mapping_result.json images_output target_data out_pairs
+사용 예:
+python .\5_check_map_result.py ^
+  ".\map_dist\mapping_result.json" ^
+  ".\images_output" ^
+  ".\target_data\자동등록 사진 모음" ^
+  ".\inspect_pairs" ^
+  --export-csv .\inspect_pairs\manifest.csv
 
-Usage (processed low/gray):
-  python 5_check_map_result.py mapping_result.json images_output target_data out_pairs_low_gray ^
-    --mode processed --processed-root processed ^
-    --track low --channel gray --preprocess-mapping preprocess_mapping.json
+동작:
+- mapping_result.json에서 (original_path, extracted_path) 페어를 읽어
+  out_dir/<pair_####>/에 각 파일을 복사합니다.
+- --export-csv가 주어지면 매니페스트 CSV를 저장합니다.
+
+안전장치:
+- JSON 최상위에 'pairs'(list)와 'map'(dict)이 함께 있어도 안전 처리
+- 경로가 절대경로로 존재하지 않으면, 각 root와 basename으로 재해결 시도
+- 출력 폴더/CSV의 부모 폴더 자동 생성
 """
-from __future__ import annotations
 
 import argparse
-import csv
 import json
 import os
 import shutil
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
-# ─────────────── Path & utils ───────────────
-def norm(p: str) -> str:
-    """Normalize path for comparisons (slash + lowercase)."""
-    return str(Path(p)).replace("\\", "/").lower()
+import pandas as pd
 
-def is_extracted_identity(p: str) -> bool:
-    return "bindata" in norm(p)
 
-def resolve_raw(path_str: str, hint_root: Path) -> Optional[Path]:
-    """
-    RAW 해상: 1) 그대로 존재하면 사용  2) 없으면 basename으로 hint_root 하위 탐색
-    """
-    p = Path(path_str)
-    if p.is_file():
-        return p
-    cand = list(hint_root.rglob(Path(path_str).name))
-    return cand[0] if cand else None
-
-def link_or_copy(src: Path, dst: Path, mode: str = "copy") -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        if mode == "hardlink":
-            os.link(src, dst)
-            return
-        if mode == "symlink":
-            dst.symlink_to(src.resolve())
-            return
-    except Exception:
-        pass  # fallback to copy
-    shutil.copy2(src, dst)
-
-# ─────────────── Preprocessed resolver ───────────────
-def norm_channel(ch: str) -> str:
-    t = str(ch).strip().lower()
-    if t in {"gray", "grey", "그레이"} or t.endswith("_g"):
-        return "gray"
-    if t in {"color", "colour", "컬러"} or t.endswith("_c"):
-        return "color"
-    return t  # 그대로 둠
-
-class PreprocIndex:
-    """
-    (origin, track, channel) -> preprocessed filename (e.g., 000123.png)
-    """
-    def __init__(self, mp: Dict[str, Dict]):
-        self.idx: Dict[Tuple[str, str, str], str] = {}
-        for out_name, meta in mp.items():
-            o = norm(meta.get("원본_전체_경로", ""))
-            tr = str(meta.get("트랙", "")).lower()
-            ch = norm_channel(str(meta.get("채널", "")))
-            if o and tr and ch:
-                self.idx[(o, tr, ch)] = out_name  # last write wins
-
-    def get(self, origin_path: str, track: str, channel: str) -> Optional[str]:
-        return self.idx.get((norm(origin_path), track.lower(), channel.lower()))
-
-def resolve_preprocessed(
-    origin_identity: str,
-    processed_root: Path,
-    track: str,
-    channel: str,
-    pp_index: PreprocIndex,
-) -> Optional[Path]:
-    """
-    processed/{extracted|original}/{track}/{channel}/<filename>
-    """
-    out_name = pp_index.get(origin_identity, track, channel)
-    if not out_name:
-        return None
-    category = "extracted" if is_extracted_identity(origin_identity) else "original"
-    p = processed_root / category / track / channel / out_name
-    return p if p.is_file() else None
-
-# ─────────────── Mapping normalize ───────────────
-def unify_pairs(raw_map: Dict[str, str]) -> List[Tuple[str, str]]:
-    """
-    (original_identity, extracted_identity) 리스트로 정규화.
-    한쪽만 BinData면 방향 확정. 그 외엔 값 쪽이 BinData면 유지, 아니면 교환.
-    """
-    pairs: List[Tuple[str, str]] = []
-    for k, v in raw_map.items():
-        k_ex, v_ex = is_extracted_identity(k), is_extracted_identity(v)
-        if v_ex and not k_ex:
-            pairs.append((k, v))
-        elif k_ex and not v_ex:
-            pairs.append((v, k))
-        else:
-            pairs.append((k, v) if v_ex else (v, k))
-    return pairs
-
-# ─────────────── CLI ───────────────
 def parse_args() -> argparse.Namespace:
-    pa = argparse.ArgumentParser(
-        description="Collect mapped pairs into a flat folder for inspection",
+    ap = argparse.ArgumentParser(
+        description="Collect mapped (orig, extracted) image pairs for visual inspection.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    # positional (backward-compatible)
-    pa.add_argument("map_json", help="mapping_result.json (orig↔extracted)")
-    pa.add_argument("extracted_dir", help="ROOT of RAW extracted images (e.g., images_output)")
-    pa.add_argument("original_root", help="ROOT of RAW original images (folder tree)")
-    pa.add_argument("out_dir", help="Destination folder")
+    ap.add_argument("mapping_json", help="mapping_result.json")
+    ap.add_argument("extracted_root", help="root folder of extracted images (e.g., images_output)")
+    ap.add_argument("reference_root", help="root folder of reference originals (e.g., target_data/자동등록 사진 모음)")
+    ap.add_argument("out_dir", help="output directory to copy pairs into")
+    ap.add_argument("--export-csv", default=None, help="path to export manifest CSV")
+    return ap.parse_args()
 
-    # options
-    pa.add_argument("--mode", choices=["raw", "processed"], default="raw",
-                    help="Copy RAW or PREPROCESSED files")
-    pa.add_argument("--processed-root", default="processed",
-                    help="Root containing processed/extracted|original")
-    pa.add_argument("--preprocess-mapping", default="preprocess_mapping.json",
-                    help="Mapping to resolve preprocessed filenames")
-    pa.add_argument("--track", choices=["low", "high"], default="low")
-    pa.add_argument("--channel", choices=["gray", "color"], default="gray")
-    pa.add_argument("--link", choices=["copy", "hardlink", "symlink"], default="copy")
-    pa.add_argument("--export-csv", default=None, help="Write manifest CSV (dst, src)")
-    return pa.parse_args()
 
-# ─────────────── Main ───────────────
-def main() -> None:
+# ──────────────────────────────── JSON 로딩/정규화 ────────────────────────────────
+def load_pairs_from_mapping(mapping_path: Path) -> List[Dict]:
+    """
+    mapping_result.json을 읽어 (orig, extracted) 페어 리스트를 반환.
+    - 우선 'pairs' 리스트를 사용(여기에 score 등 메타 포함)
+    - 없으면 'map' dict을 변환
+    - 둘 다 없으면, 최상위가 dict[str,str]이면 그대로 변환
+    반환: [{orig, extracted, score, inliers, kpA, kpB, track, ex_used, or_used}, ...]
+    """
+    js = json.loads(mapping_path.read_text("utf-8"))
+
+    rows: List[Dict] = []
+
+    if isinstance(js, dict) and isinstance(js.get("pairs"), list):
+        for it in js["pairs"]:
+            if not isinstance(it, dict):
+                continue
+            o = it.get("original_path")
+            e = it.get("extracted_path")
+            if isinstance(o, str) and isinstance(e, str):
+                rows.append({
+                    "orig": o,
+                    "extracted": e,
+                    "score": it.get("score"),
+                    "inliers": it.get("inliers"),
+                    "kpA": it.get("kpA"),
+                    "kpB": it.get("kpB"),
+                    "track": it.get("track"),
+                    "ex_used": it.get("ex_used"),
+                    "or_used": it.get("or_used"),
+                })
+        if rows:
+            return rows
+
+    if isinstance(js, dict) and isinstance(js.get("map"), dict):
+        for o, e in js["map"].items():
+            if isinstance(o, str) and isinstance(e, str):
+                rows.append({"orig": o, "extracted": e})
+        if rows:
+            return rows
+
+    if isinstance(js, dict):  # 구버전: 최상위가 바로 {orig: extracted}
+        ok = True
+        for k, v in js.items():
+            if not (isinstance(k, str) and isinstance(v, str)):
+                ok = False
+                break
+        if ok:
+            for o, e in js.items():
+                rows.append({"orig": o, "extracted": e})
+            return rows
+
+    raise ValueError("mapping_result.json에서 유효한 페어 정보를 찾지 못했습니다. ('pairs' 또는 'map' 필요)")
+
+
+# ──────────────────────────────── 경로 해석/복사 ────────────────────────────────
+def resolve_existing_path(raw: str, root: Path) -> Optional[Path]:
+    """
+    우선 raw 경로가 존재하면 그대로 사용.
+    아니면 root / basename(raw)를 시도.
+    그래도 없으면 None.
+    """
+    if isinstance(raw, str):
+        p = Path(raw)
+        if p.exists():
+            return p
+        alt = root / Path(raw).name
+        if alt.exists():
+            return alt
+    return None
+
+
+def copy_if_exists(src: Optional[Path], dst: Path) -> Tuple[Optional[Path], str]:
+    """
+    src가 있으면 dst로 복사(부모 mkdir), 상태 문자열 반환('copied' 또는 'missing').
+    """
+    if src is None or not src.exists():
+        return None, "missing"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(str(src), str(dst))
+        return dst, "copied"
+    except Exception:
+        return None, "error"
+
+
+# ──────────────────────────────── 메인 ────────────────────────────────
+def main():
     args = parse_args()
+    mapping_path = Path(args.mapping_json)
+    ex_root = Path(args.extracted_root)
+    or_root = Path(args.reference_root)
+    out_dir = Path(args.out_dir)
 
-    mapping_raw: Dict[str, str] = json.loads(Path(args.map_json).read_text(encoding="utf-8"))
-    pairs = unify_pairs(mapping_raw)
+    pairs = load_pairs_from_mapping(mapping_path)
 
-    extracted_root = Path(args.extracted_dir)
-    original_root  = Path(args.original_root)
-    dst_root       = Path(args.out_dir)
+    manifest_rows: List[Dict] = []
+    copied_ok = 0
 
-    shutil.rmtree(dst_root, ignore_errors=True)
-    dst_root.mkdir(parents=True, exist_ok=True)
-
-    # Preprocessed index (optional)
-    pp_index: Optional[PreprocIndex] = None
-    processed_root = Path(args.processed_root)
-    if args.mode == "processed":
-        try:
-            mp = json.loads(Path(args.preprocess_mapping).read_text(encoding="utf-8"))
-            pp_index = PreprocIndex(mp)
-        except Exception as e:
-            print(f"[WARN] failed to load preprocess mapping: {e}")
-
-    seen_extracted: set[Path] = set()
-    copied = 0
-    rows_for_csv: List[Tuple[str, str]] = []
-
-    for idx, (orig_id, ex_id) in enumerate(pairs, start=1):
-        # Resolve src paths
-        if args.mode == "processed" and pp_index is not None:
-            orig_path = resolve_preprocessed(orig_id, processed_root, args.track, args.channel, pp_index) \
-                        or resolve_raw(orig_id, original_root)
-            ex_path   = resolve_preprocessed(ex_id,   processed_root, args.track, args.channel, pp_index) \
-                        or resolve_raw(ex_id, extracted_root)
-        else:
-            orig_path = resolve_raw(orig_id, original_root)
-            ex_path   = resolve_raw(ex_id, extracted_root)
-
-        if not orig_path or not ex_path:
-            print(f"[WARN] missing file — orig:{orig_id}, ex:{ex_id}")
+    for idx, it in enumerate(pairs, start=1):
+        o_raw = it.get("orig")
+        e_raw = it.get("extracted")
+        if not (isinstance(o_raw, str) and isinstance(e_raw, str)):
             continue
 
-        if ex_path in seen_extracted:
-            print(f"[WARN] extracted image reused → {ex_path}")
-        seen_extracted.add(ex_path)
+        # 경로 해석(존재 우선, 실패시 root + basename 대체)
+        o_src = resolve_existing_path(o_raw, or_root)
+        e_src = resolve_existing_path(e_raw, ex_root)
 
-        prefix   = f"{idx:04d}_{orig_path.stem}"
-        dst_ori  = dst_root / f"{prefix}_원본{orig_path.suffix}"
-        dst_ex   = dst_root / f"{prefix}_추출{ex_path.suffix}"
+        # 출력 경로(페어별 하위 폴더)
+        pair_dir = out_dir / f"pair_{idx:04d}"
+        pair_dir.mkdir(parents=True, exist_ok=True)
+        o_dst = pair_dir / f"or_{Path(o_raw).name}"
+        e_dst = pair_dir / f"ex_{Path(e_raw).name}"
 
-        try:
-            link_or_copy(orig_path, dst_ori, args.link)
-            link_or_copy(ex_path,  dst_ex,  args.link)
-            rows_for_csv.append((str(dst_ori), str(orig_path)))
-            rows_for_csv.append((str(dst_ex),  str(ex_path)))
-            copied += 1
-            print(f"[COPY] {dst_ori.name} , {dst_ex.name}")
-        except Exception as e:
-            print(f"[ERROR] copy failed: {e}")
+        e_out, e_status = copy_if_exists(e_src, e_dst)
+        o_out, o_status = copy_if_exists(o_src, o_dst)
 
+        if e_status == "copied" and o_status == "copied":
+            copied_ok += 1
+
+        manifest_rows.append({
+            "pair_id": idx,
+            "orig": o_raw,
+            "extracted": e_raw,
+            "orig_exists": bool(o_src and o_src.exists()),
+            "extracted_exists": bool(e_src and e_src.exists()),
+            "orig_copied": (o_status == "copied"),
+            "extracted_copied": (e_status == "copied"),
+            "orig_dst": str(o_out) if o_out else None,
+            "extracted_dst": str(e_out) if e_out else None,
+            # 메타가 있으면 포함
+            "score": it.get("score"),
+            "inliers": it.get("inliers"),
+            "kpA": it.get("kpA"),
+            "kpB": it.get("kpB"),
+            "track": it.get("track"),
+            "ex_used": it.get("ex_used"),
+            "or_used": it.get("or_used"),
+        })
+
+    # 매니페스트 저장
     if args.export_csv:
-        with open(args.export_csv, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f)
-            w.writerow(["dst_path", "src_path"])
-            w.writerows(rows_for_csv)
-        print(f"[SAVE] manifest: {args.export_csv}")
+        export_path = Path(args.export_csv)
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(manifest_rows).to_csv(export_path, index=False, encoding="utf-8-sig")
 
-    print(f"[DONE] Copied {copied}/{len(pairs)} pairs → '{dst_root}'")
+    # 콘솔 요약
+    total = len(pairs)
+    print("===== CHECK RESULT =====")
+    print(f"Total pairs in mapping: {total}")
+    print(f"Copied OK (both sides): {copied_ok}")
+    missing_e = sum(1 for r in manifest_rows if not r["extracted_exists"])
+    missing_o = sum(1 for r in manifest_rows if not r["orig_exists"])
+    print(f"Missing extracted files: {missing_e}")
+    print(f"Missing original files : {missing_o}")
+    if args.export_csv:
+        print(f"[SAVE] manifest → {args.export_csv}")
+    print("[DONE] copy complete.")
+
 
 if __name__ == "__main__":
     main()

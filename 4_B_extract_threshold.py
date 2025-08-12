@@ -1,19 +1,27 @@
 # 4_B_extract_threshold.py
 """
-ORB + RANSAC 임계값 추정기 (간소화 버전)
+ORB + RANSAC 임계값 추정기 (정리판, label 충돌 수정반영)
 
-- 입력: candidates.json, preprocess_mapping.json, (옵션) hand_label.csv
-- 출력: outputs/match_scores.csv, outputs/thresholds.json, orb_hist.png, orb_cdf.png
+- 요구 입력:
+  1) candidates.json   : 각 타깃(=원본 identity)에 대한 후보(extracted) 목록.
+     * 필수 필드: "original_path", "track"(low|high), "candidates":[{"name": <경로>}]
+  2) preprocess_mapping.json : 전처리 메타. 필수 필드:
+     - "원본_전체_경로", "카테고리"(extracted|reference), "트랙"(low|high), "채널"(gray|color)
+  3) (선택) hand_label.csv : 컬럼 고정 ["orig_path","extracted_path","label"(1/0)]
+
+- 출력:
+  <out>/match_scores.csv, <out>/thresholds.json, <out>/orb_hist.png, <out>/orb_cdf.png
 
 예)
 python 4_B_extract_threshold.py ^
-  --candidates-json candidates.json ^
-  --mapping preprocess_mapping.json ^
-  --images-root processed ^
-  --out-dir outputs ^
+  --candidates-json .\candidates.json ^
+  --mapping .\preprocess_mapping.json ^
+  --images-root .\processed ^
+  --out-dir .\feat_dist ^
   --pos-mode top1 ^
   --neg-mode hard ^
-  --neg-ratio 1.0
+  --neg-ratio 1.0 ^
+  --target-tpr 0.97
 """
 
 import argparse
@@ -21,7 +29,7 @@ import json
 import os
 import random
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import cv2
 import numpy as np
@@ -31,16 +39,10 @@ from joblib import Memory
 from tqdm import tqdm
 from scipy.stats import beta
 
-# 선택 의존성: 없으면 분위수로 폴백
-try:
-    from kneed import KneeLocator  # type: ignore
-except Exception:
-    KneeLocator = None
-
 cv2.setNumThreads(0)
 CACHE = Memory(".cache/descriptors", verbose=0)
 
-# ─────────────── I/O & 경로 ───────────────
+# ────────────────────────────── 유틸 ──────────────────────────────
 def norm_identity(p: str) -> str:
     return os.path.normpath(p).lower()
 
@@ -56,7 +58,7 @@ def safe_imread(path: str, flag=cv2.IMREAD_GRAYSCALE):
     except Exception:
         return None
 
-# ─────────────── ORB + RANSAC ───────────────
+# ─────────────────────── ORB + RANSAC 점수 ───────────────────────
 @CACHE.cache
 def extract_orb(path: str, n: int = 1500):
     img = safe_imread(path, cv2.IMREAD_GRAYSCALE)
@@ -79,115 +81,162 @@ def orb_score(a: str, b: str, nfeatures: int = 1500, ratio: float = 0.75, ransac
     if len(good) < 4:
         return 0, len(ptsA), len(ptsB)
 
-    src = np.float32([ptsA[m.queryIdx] for m in good])
-    dst = np.float32([ptsB[m.trainIdx] for m in good])
-    _, mask = cv2.findHomography(src, dst, cv2.RANSAC, ransac_thresh)
-    inl = int(mask.sum()) if mask is not None else 0
-    return inl, len(ptsA), len(ptsB)
+    src = np.float32([ptsA[m.queryIdx] for m in good]).reshape(-1, 1, 2)
+    dst = np.float32([ptsB[m.trainIdx] for m in good]).reshape(-1, 1, 2)
+    _H, mask = cv2.findHomography(src, dst, cv2.RANSAC, ransac_thresh)
+    inliers = int(mask.sum()) if mask is not None else 0
+    return inliers, len(ptsA), len(ptsB)
 
-def knee_or_quantile(values: List[float], q: float = 0.97) -> float:
+def quantile_threshold(values: List[float], q: float = 0.97) -> float:
     if not values:
         return 0.0
-    xs = sorted(values)
-    if KneeLocator is not None and len(xs) >= 10:
-        cdf = np.linspace(0, 1, len(xs))
-        try:
-            k = KneeLocator(xs, cdf, curve="concave", direction="increasing")
-            if k.knee is not None:
-                return float(k.knee)
-        except Exception:
-            pass
-    return float(np.quantile(xs, q))
+    return float(np.quantile(sorted(values), q))
 
-# ─────────────── 매핑/전처리 선택 ───────────────
+# ─────────────────────── 매핑 LUT 생성/조회 ───────────────────────
 def build_lookup(pre_map: Dict, images_root: Path) -> Dict[str, Dict[Tuple[str, str, str], str]]:
     """
-    identity(원본 풀 경로 정규화) -> {(category, track, channel): relative processed path}
+    identity(원본 풀 경로 정규화) -> {(category(extracted|reference), track, channel): relative processed path}
+    ※ 카테고리/트랙/채널은 매핑 메타의 값을 그대로 사용(소문자 정규화)
     """
     lut: Dict[str, Dict[Tuple[str, str, str], str]] = {}
     for proc_name, meta in pre_map.items():
-        origin = meta.get("원본_전체_경로", "")
-        track = str(meta.get("트랙", "")).lower()
-        ch = str(meta.get("채널", "")).lower()
-        cat = "extracted" if "BinData" in origin else "original"
-        rel = f"{cat}/{track}/{ch}/{proc_name}"
-        lut.setdefault(norm_identity(origin), {})[(cat, track, ch)] = rel
+        origin = meta.get("원본_전체_경로")
+        cat = str(meta.get("카테고리")).lower()
+        trk = str(meta.get("트랙")).lower()
+        ch = str(meta.get("채널")).lower()
+
+        if origin is None or cat not in ("extracted", "reference"):
+            raise ValueError("preprocess_mapping.json: '원본_전체_경로' 또는 '카테고리(extracted|reference)'가 올바르지 않습니다.")
+
+        rel = f"{cat}/{trk}/{ch}/{proc_name}"
+        lut.setdefault(norm_identity(origin), {})[(cat, trk, ch)] = rel
     return lut
+
+def category_of_identity(identity_path: str, track: str,
+                         lut: Dict[str, Dict[Tuple[str, str, str], str]]) -> Optional[str]:
+    """
+    매핑 LUT에 등록된 카테고리로 판별.
+    동일 identity에 대해 주어진 track에 매칭되는 카테고리가 있으면 반환.
+    """
+    key = norm_identity(identity_path)
+    options = lut.get(key, {})
+    cats = {c for (c, t, _), _rel in options.items() if t == track}
+    if "extracted" in cats:
+        return "extracted"
+    if "reference" in cats:
+        return "reference"
+    return None
 
 def pick_preprocessed(identity_path: str, track: str, prefer_gray: bool,
                       lut: Dict[str, Dict[Tuple[str, str, str], str]], images_root: Path) -> str:
     """
-    동일 identity 내에서 (category 동일 → track 동일 → 채널 선호) 우선, 없으면 원본 경로 사용.
+    동일 identity 내에서 (카테고리→트랙→채널) 우선순위로 전처리본 경로 반환.
+    카테고리는 LUT 기반으로 판별(등록된 값만 사용).
     """
     key = norm_identity(identity_path)
     options = lut.get(key, {})
     if not options:
         return identity_path
 
-    order = ["gray", "color"] if prefer_gray else ["color", "gray"]
-    cat = "extracted" if "BinData" in identity_path else "original"
+    cat = category_of_identity(identity_path, track, lut)
+    if cat is None:
+        return identity_path
 
+    order = ["gray", "color"] if prefer_gray else ["color", "gray"]
     for ch in order:
         tup = (cat, track, ch)
         if tup in options:
             return str(images_root / options[tup])
 
+    # 동일 트랙 내 임의 채널 대체
     for (c2, t2, ch2), rel in options.items():
-        if t2 == track and ch2 in order:
+        if c2 == cat and t2 == track:
             return str(images_root / rel)
 
     return identity_path
 
-# ─────────────── 페어 구성 ───────────────
-def load_positive_pairs(cand_json: Dict, mode: str = "top1") -> List[Tuple[str, str, str]]:
+# ────────────────────────── 페어 구성 ──────────────────────────
+def load_positive_pairs(cand_json: Dict, lut: Dict[str, Dict[Tuple[str, str, str], str]],
+                        mode: str = "top1") -> List[Tuple[str, str, str]]:
     """
-    candidates.json → [(extracted_identity, original_identity, track)]
+    candidates.json → [(extracted_identity, reference_identity, track)]
+    - 필수: info["original_path"], info["track"], info["candidates"]
+    - 카테고리 판별은 LUT 기반
     """
     pos: List[Tuple[str, str, str]] = []
-    for origin_path, info in cand_json.items():
-        track = str(info.get("track", "low")).lower()
-        items = info.get("candidates", info.get("extracted_candidates", [])) or []
+    for _key, info in cand_json.items():
+        origin_path = info.get("original_path")
+        track = str(info.get("track", "")).lower()
+        items = info.get("candidates")
+
+        if not origin_path or track not in ("low", "high") or not isinstance(items, list):
+            raise ValueError("candidates.json: 'original_path', 'track(low|high)', 'candidates' 필드가 필요합니다.")
+
         chosen = [items[0]] if (mode == "top1" and items) else items
         for c in chosen:
             name = c.get("name")
             if not name:
                 continue
-            a, b = origin_path, name
-            if ("BinData" in a) == ("BinData" in b):
+
+            # LUT로 카테고리 판별
+            cat_a = category_of_identity(origin_path, track, lut)
+            cat_b = category_of_identity(name, track, lut)
+            if cat_a is None or cat_b is None or cat_a == cat_b:
                 continue
-            ex = a if "BinData" in a else b
-            ori = b if "BinData" not in b else a
+
+            if cat_a == "extracted" and cat_b == "reference":
+                ex, ori = origin_path, name
+            elif cat_a == "reference" and cat_b == "extracted":
+                ex, ori = name, origin_path
+            else:
+                continue
+
             pos.append((ex, ori, track))
     return pos
 
 def sample_negatives(pos_pairs: List[Tuple[str, str, str]], ratio: float = 1.0,
                      mode: str = "hard", seed: int = 0) -> List[Tuple[str, str, str]]:
     rng = random.Random(seed)
+    if not pos_pairs or ratio <= 0:
+        return []
+
+    # ex/ori 별 집합 및 정답 매핑
     ex_ids = sorted({ex for ex, _, _ in pos_pairs})
     or_ids = sorted({ori for _, ori, _ in pos_pairs})
-    ex2tracks: Dict[str, List[str]] = {}
-    for ex, _, tr in pos_pairs:
-        ex2tracks.setdefault(ex, [])
-        if tr not in ex2tracks[ex]:
-            ex2tracks[ex].append(tr)
+    truth_map: Dict[str, set[str]] = {}
+    ex_tracks: Dict[str, List[str]] = {}
+    for ex, ori, tr in pos_pairs:
+        truth_map.setdefault(ex, set()).add(ori)
+        ex_tracks.setdefault(ex, [])
+        if tr not in ex_tracks[ex]:
+            ex_tracks[ex].append(tr)
 
-    pos_set = {(ex, ori) for ex, ori, _ in pos_pairs}
-    need = int(len(pos_pairs) * ratio)
-    mult = 3 if mode == "hard" else 1
-    cand: List[Tuple[str, str, str]] = []
+    target = int(len(pos_pairs) * ratio)
+    neg: List[Tuple[str, str, str]] = []
+    tries = 0
 
-    while len(cand) < need * mult and ex_ids and or_ids:
-        ex = rng.choice(ex_ids)
-        ori = rng.choice(or_ids)
-        if (ex, ori) in pos_set:
+    if mode == "shuffle":
+        while len(neg) < target and tries < target * 20:
+            tries += 1
+            e = rng.choice(ex_ids)
+            o = rng.choice(or_ids)
+            if o in truth_map.get(e, set()):
+                continue
+            tr = rng.choice(ex_tracks.get(e, ["low"]))
+            neg.append((e, o, tr))
+        return neg
+
+    # hard: 정답 ORI 제외 + 같은 ex의 트랙을 유지
+    while len(neg) < target and tries < target * 50:
+        tries += 1
+        e, _o_true, tr = rng.choice(pos_pairs)
+        o = rng.choice(or_ids)
+        if o in truth_map.get(e, set()):
             continue
-        tr = rng.choice(ex2tracks.get(ex, ["low"]))
-        cand.append((ex, ori, tr))
+        neg.append((e, o, tr))
+    return neg
 
-    uniq = list(dict.fromkeys(cand))
-    return uniq[:need]
-
-# ─────────────── CLI ───────────────
+# ────────────────────────── CLI ──────────────────────────
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="Estimate ORB+RANSAC threshold from candidates & preprocessed images",
@@ -209,7 +258,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--seed", type=int, default=0)
     return ap.parse_args()
 
-# ─────────────── Main ───────────────
+# ────────────────────────── Main ──────────────────────────
 def main():
     args = parse_args()
     out = Path(args.out_dir)
@@ -219,8 +268,11 @@ def main():
     pre_map = json.loads(Path(args.mapping).read_text("utf-8"))
     images_root = Path(args.images_root)
 
+    # LUT 생성(메타 기반, reference 명칭 고정)
     lut = build_lookup(pre_map, images_root)
-    pos = load_positive_pairs(cand_json, args.pos_mode)
+
+    # 양성/음성 페어 구성
+    pos = load_positive_pairs(cand_json, lut, args.pos_mode)
     neg = sample_negatives(pos, ratio=args.neg_ratio, mode=args.neg_mode, seed=args.seed)
     print(f"[INFO] positives: {len(pos):,} , negatives: {len(neg):,}")
 
@@ -229,7 +281,7 @@ def main():
     all_pairs = [("P",) + p for p in pos] + [("N",) + p for p in neg]
     random.Random(args.seed).shuffle(all_pairs)
 
-    for label, ex_id, or_id, track in tqdm(all_pairs, ncols=80, desc="ORB"):
+    for pair, ex_id, or_id, track in tqdm(all_pairs, ncols=80, desc="ORB"):
         ex_path = pick_preprocessed(ex_id, track, True, lut, images_root)
         or_path = pick_preprocessed(or_id, track, True, lut, images_root)
         try:
@@ -245,7 +297,7 @@ def main():
 
         score = inl / (kA + 1e-6)
         rows.append(dict(
-            label=label,
+            pair=pair,  # ← 'label' 대신 'pair' 사용(P/N)
             ex_id=Path(ex_id).name, or_id=Path(or_id).name,
             ex_path=ex_id, or_path=or_id,
             ex_used=str(ex_path), or_used=str(or_path),
@@ -254,38 +306,40 @@ def main():
         ))
 
     print(f"[INFO] file-read failures: {miss}")
+
+    # 저장
     df = pd.DataFrame(rows)
     df.to_csv(out / "match_scores.csv", index=False, encoding="utf-8-sig")
-    print(f"[SAVE] {out / 'match_scores.csv'}  rows={len(df):,}")
+    print(f"[SAVE] {out/'match_scores.csv'}")
 
-    # ── 임계값 ──
-    thr_info: Dict[str, float | None] = {"orb_score": None, "ci_low": None, "ci_high": None}
+    # ── 임계값 산정 ──
+    thr_info: Dict[str, Optional[float]] = {"orb_score": None, "ci_low": None, "ci_high": None}
 
     if args.labels_csv and Path(args.labels_csv).is_file():
         lab = pd.read_csv(args.labels_csv, encoding="utf-8-sig")
-        cols = {c.lower(): c for c in lab.columns}
-        ocol = cols.get("orig_path", cols.get("orig"))
-        ecol = cols.get("extracted_path", cols.get("extracted"))
-        lcol = cols.get("label", cols.get("y"))
-        if not (ocol and ecol and lcol):
-            raise ValueError("labels-csv must contain columns: orig_path/extracted_path/label")
-        lab = lab.rename(columns={ocol: "orig", ecol: "extracted", lcol: "label"})
-        lab["orig_b"] = lab["orig"].apply(lambda s: Path(str(s)).name)
-        lab["extr_b"] = lab["extracted"].apply(lambda s: Path(str(s)).name)
+        must = {"orig_path", "extracted_path", "label"}
+        if (must - set(lab.columns)):
+            raise ValueError("labels-csv must contain EXACTLY these columns: orig_path, extracted_path, label")
+
+        lab = lab[["orig_path", "extracted_path", "label"]].copy()
+        lab["orig_b"] = lab["orig_path"].apply(lambda s: Path(str(s)).name)
+        lab["extr_b"] = lab["extracted_path"].apply(lambda s: Path(str(s)).name)
+        lab["label"] = lab["label"].astype(int)
 
         d2 = df.copy()
         d2["orig_b"] = d2["or_id"]
         d2["extr_b"] = d2["ex_id"]
+
+        # 충돌 방지를 위해 df에는 'pair' 컬럼만 존재(라벨명 미충돌)
         merged = d2.merge(lab[["orig_b", "extr_b", "label"]], on=["orig_b", "extr_b"], how="left")
-        merged["label"] = merged["label"].fillna(-1).astype(int)
-        labeled = merged[merged["label"] >= 0].copy()
+        labeled = merged.dropna(subset=["label"]).copy()
 
         if labeled.empty:
             print("[WARN] no labeled pairs matched; falling back to no-label mode.")
         else:
             y = (labeled["label"] == 1).astype(int).values
             s = labeled["score"].values
-            thr = None
+            thr: Optional[float] = None
             for t in np.linspace(0, 1, 101):
                 tp = int(((s >= t) & (y == 1)).sum())
                 fn = int((y == 1).sum()) - tp
@@ -297,26 +351,23 @@ def main():
                     thr = t
                     break
             if thr is None:
-                tp = int((y == 1).sum())
-                fallback = float(np.quantile(s[y == 1], 0.05)) if (y == 1).any() else 0.0
-                thr_info = {
-                    "orb_score": fallback,
-                    "ci_low": float(beta.ppf(0.025, 1, max(tp, 1))),
-                    "ci_high": float(beta.ppf(0.975, 1, max(tp, 1))),
-                }
+                pos_scores = s[y == 1]
+                fallback = float(np.quantile(pos_scores, 0.05)) if pos_scores.size else 0.0
+                thr_info = {"orb_score": fallback, "ci_low": None, "ci_high": None}
 
     if thr_info["orb_score"] is None:
-        pos_scores = df.loc[df["label"] == "P", "score"].tolist()
-        thr_info = {"orb_score": knee_or_quantile(pos_scores, q=0.97), "ci_low": None, "ci_high": None}
+        pos_scores = df.loc[df["pair"] == "P", "score"].tolist()
+        thr_info = {"orb_score": quantile_threshold(pos_scores, q=0.97), "ci_low": None, "ci_high": None}
 
     (out / "thresholds.json").write_text(json.dumps(thr_info, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"[KEY] threshold = {thr_info['orb_score']:.4f}")
 
     # ── 플롯 ──
     plt.figure()
-    plt.hist(df["score"].tolist(), bins=100, log=True)
-    plt.xlabel("score (inliers / keypointsA)")
-    plt.ylabel("freq (log)")
+    plt.hist(df["score"].tolist(), bins=50)
+    plt.axvline(float(thr_info["orb_score"]), ls="--")
+    plt.xlabel("score (inliers/kpA)")
+    plt.ylabel("count")
     plt.tight_layout()
     plt.savefig(out / "orb_hist.png", dpi=150)
 

@@ -75,23 +75,27 @@ python .\4_verify_mapping.py `
   -c .\candidates.json `
   -m .\preprocess_mapping.json `
   -i .\processed `
-  -o .\mapping_result.json `
-  --scores-csv .\pair_scores.csv `
-  --thresholds .\feat_dist\thresholds.json `
-  --workers 8
+  -o .\map_dist\mapping_result.json `
+  --scores-csv .\map_dist\pair_scores.csv `
+  --orb-threshold 0.01 `
+  --min-inliers 8 `
+  --min-inlier-ratio 0.15 `
+  --workers 8 `
+  --color-first
 
 
 # ───────────────────────── 5-A. 정량 평가
 python .\5_A_evaluate_mapping.py `
-  --mapping-json .\mapping_result.json `
-  --scores-csv   .\feat_dist\match_scores.csv `
-  --labels-csv   .\hand_label.csv `
-  --suggest-n    20
+  --mapping-json .\map_dist\mapping_result.json `
+  --scores-csv .\map_dist\pair_scores.csv `
+  --labels-csv .\hand_label.csv `
+  --mapping-meta .\preprocess_mapping.json `
+  --suggest-n 20
 
 
 # ───────────────────────── 5. 육안 검수용 복사
 python .\5_check_map_result.py `
-  ".\mapping_result.json" `
+  ".\map_dist\mapping_result.json" `
   ".\images_output" `
   ".\target_data\자동등록 사진 모음" `
   ".\inspect_pairs" `

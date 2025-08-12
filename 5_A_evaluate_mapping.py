@@ -1,373 +1,311 @@
 # 5_A_evaluate_mapping.py
 """
-Evaluate mapping with optional labels, collisions, per-track metrics, and PR/ROC.
+매핑 결과 평가 스크립트 (스키마 유연/안정화 버전)
 
-Inputs
-------
---mapping-json : JSON mapping (orig -> extracted) from 4_verify_mapping.py
---scores-csv   : match/pair score CSV (optional)
---labels-csv   : manual labels CSV (optional; columns: orig[_path], extracted[_path], label|y)
---mapping-meta : preprocess_mapping.json for per-track metrics (optional)
---suggest-n    : suggestions count for no-label active learning (default: 20)
+기능
+- mapping_result.json(최종 1:1 매핑)을 hand_label.csv(라벨)과 대조하여 Precision/Recall/F1 산출
+- pair_scores.csv(전체 후보 점수)에서 상위 N개 제안(suggestions) 생성(매핑에 미포함 + 음성 라벨 제외)
+- optional: preprocess_mapping.json에서 reference 타깃 수 집계 및 커버리지 계산
 
-Outputs
--------
-evaluation_report.md
-collisions.csv
-metrics_by_track.csv          (when --mapping-meta is given)
-error_scatter.png, error_pairs.html
-pr_curve.png, roc_curve.png, threshold_sweep.csv  (when labels+scores given)
-to_label.csv                  (no-label path)
+호환성
+- scores CSV 컬럼 자동 인식:
+  - 우선순위: ('orig','extracted')  → 없으면  ('or_path','ex_path')  → 없으면 ('orig_path','extracted_path')
+- labels CSV 컬럼 자동 인식:
+  - ('orig_path','extracted_path','label')를 권장, 없으면 ('orig','extracted','label') 또는 ('or_path','ex_path','label')도 허용
+- 중복 인덱스/라벨 정렬 이슈 방지: reset_index + 위치기반 대입(to_numpy) 사용
+
+출력
+- 표준 출력: 핵심 지표, 통계
+- <out_dir>/evaluation_report.json   (mapping_json 위치에 저장)
+- <out_dir>/suggestions_top{N}.csv   (scores_csv 기반 N개 제안, --suggest-n>0일 때)
 """
-
-from __future__ import annotations
 
 import argparse
 import json
-import math
-from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Tuple, List, Set
+from typing import Dict, List, Optional, Tuple
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 
-# ─────────────── I/O + Path ───────────────
-def load_mapping(path: Path) -> Dict[str, str]:
-    with path.open(encoding="utf-8") as f:
-        return json.load(f)
+# ──────────────────────────────── IO & 정규화 ────────────────────────────────
+def _basename(x: str) -> str:
+    return Path(str(x)).name
 
-def norm_path(s: str) -> str:
-    """OS 무관 경로 비교를 위한 정규화(구분자 통일 + 소문자)."""
-    return str(Path(str(s))).replace("\\", "/").lower()
 
-def load_labels_df(path: Path) -> pd.DataFrame:
-    """유연한 컬럼 처리 → ['orig','extracted','label'] 및 키 열 생성."""
-    df = pd.read_csv(path, encoding="utf-8-sig")
-    cols = {c.lower(): c for c in df.columns}
-    rename_map = {}
-    if "orig_path" in cols: rename_map[cols["orig_path"]] = "orig"
-    elif "orig" in cols:    rename_map[cols["orig"]] = "orig"
-    else: raise ValueError("Labels CSV must contain 'orig_path' or 'orig'")
-
-    if "extracted_path" in cols: rename_map[cols["extracted_path"]] = "extracted"
-    elif "extracted" in cols:    rename_map[cols["extracted"]] = "extracted"
-    else: raise ValueError("Labels CSV must contain 'extracted_path' or 'extracted'")
-
-    if "label" in cols: rename_map[cols["label"]] = "label"
-    elif "y" in cols:   rename_map[cols["y"]] = "label"
-    else: raise ValueError("Labels CSV must contain 'label' (or 'y')")
-
-    df = df.rename(columns=rename_map)[["orig", "extracted", "label"]]
-    df["label"] = df["label"].astype(int)
-    df["orig"] = df["orig"].astype(str)
-    df["extracted"] = df["extracted"].astype(str)
-    df["orig_base"] = df["orig"].apply(lambda s: Path(str(s)).name)
-    df["extracted_base"] = df["extracted"].apply(lambda s: Path(str(s)).name)
-    df["key_full"] = df["orig"].apply(norm_path) + "||" + df["extracted"].apply(norm_path)
-    df["key_base"] = df["orig_base"].str.lower() + "||" + df["extracted_base"].str.lower()
+def read_mapping_json(p: Path) -> pd.DataFrame:
+    js = json.loads(p.read_text("utf-8"))
+    pairs = js.get("pairs", [])
+    # 예상 키: original_path, extracted_path, score, inliers, kpA, kpB, track, ex_used, or_used
+    rows = []
+    for it in pairs:
+        rows.append({
+            "orig": it.get("original_path"),
+            "extracted": it.get("extracted_path"),
+            "score": it.get("score", np.nan),
+            "inliers": it.get("inliers", np.nan),
+            "kpA": it.get("kpA", np.nan),
+            "kpB": it.get("kpB", np.nan),
+            "track": str(it.get("track", "")).lower() if it.get("track") is not None else "",
+            "ex_used": it.get("ex_used"),
+            "or_used": it.get("or_used"),
+        })
+    df = pd.DataFrame(rows).reset_index(drop=True)
+    if not {"orig", "extracted"} <= set(df.columns):
+        raise ValueError("mapping_result.json에 'pairs[].original_path'와 'pairs[].extracted_path'가 필요합니다.")
+    # base columns
+    df["orig_b"] = df["orig"].astype(str).map(_basename).to_numpy()
+    df["extr_b"] = df["extracted"].astype(str).map(_basename).to_numpy()
     return df
+
 
 def read_scores_csv(p: Path) -> pd.DataFrame:
-    """
-    4_B_extract_threshold.py / 4_verify_mapping.py 산출물 호환:
-      - or_id/ex_id (basename) 또는 or_path/ex_path (fullpath)
-      - 없을 시 score = inliers / kpA 로 유도
-    """
     df = pd.read_csv(p, encoding="utf-8-sig")
-    low = {c.lower(): c for c in df.columns}
-    rename = {}
-    if "or_id"   in low: rename[low["or_id"]]   = "orig"
-    if "ex_id"   in low: rename[low["ex_id"]]   = "extracted"
-    if "or_path" in low: rename[low["or_path"]] = "orig"
-    if "ex_path" in low: rename[low["ex_path"]] = "extracted"
-    df = df.rename(columns=rename)
+    # 스키마 정규화
+    colmap_candidates = [
+        {"or_path": "orig", "ex_path": "extracted"},
+        {"orig_path": "orig", "extracted_path": "extracted"},
+    ]
+    for cmap in colmap_candidates:
+        overlap = set(cmap.keys()) & set(df.columns)
+        if overlap:
+            df = df.rename(columns={k: v for k, v in cmap.items() if k in df.columns})
+            break
+    # 이미 올바른 스키마면 통과
+    if not {"orig", "extracted"} <= set(df.columns):
+        raise ValueError("scores-csv에는 'orig'와 'extracted' 컬럼(또는 호환 별칭 or_path/ex_path, orig_path/extracted_path)이 필요합니다.")
 
-    if not {"orig", "extracted"}.issubset(df.columns):
-        raise ValueError("scores-csv must include 'orig' and 'extracted' (or or_id/ex_id, or or_path/ex_path).")
+    # 안정성: RangeIndex 보장
+    df = df.reset_index(drop=True)
 
+    # base columns
+    df["orig_b"] = df["orig"].astype(str).map(_basename).to_numpy()
+    df["extr_b"] = df["extracted"].astype(str).map(_basename).to_numpy()
+
+    # 보조 컬럼이 없을 수 있으니 기본값 처리
     if "score" not in df.columns:
-        if {"inliers", "kpA"}.issubset(df.columns):
-            kp = df["kpA"].replace(0, np.nan).astype(float)
-            df["score"] = df["inliers"].astype(float) / kp
-            df["score"] = df["score"].fillna(0.0)
-        else:
-            raise ValueError("scores-csv missing 'score' and cannot derive from 'inliers'/'kpA'.")
-
-    for c, default in (("inliers", 0), ("kpA", 1)):
+        df["score"] = np.nan
+    for c in ("inliers", "kpA", "kpB"):
         if c not in df.columns:
-            df[c] = default
+            df[c] = np.nan
+    if "track" not in df.columns:
+        df["track"] = ""
 
-    df["orig"] = df["orig"].astype(str)
-    df["extracted"] = df["extracted"].astype(str)
-    df["orig_base"] = df["orig"].apply(lambda s: Path(str(s)).name)
-    df["extracted_base"] = df["extracted"].apply(lambda s: Path(str(s)).name)
-    df["key_full"] = df["orig"].apply(norm_path) + "||" + df["extracted"].apply(norm_path)
-    df["key_base"] = df["orig_base"].str.lower() + "||" + df["extracted_base"].str.lower()
     return df
 
 
-# ─────────────── Metrics ───────────────
-def confusion_from_labels_df(labels: pd.DataFrame, mapping: Dict[str, str]) -> Tuple[int, int, int, int]:
-    TP = FP = FN = TN = 0
-    preds = {(norm_path(o), norm_path(e)) for o, e in mapping.items()}
-    for row in labels.itertuples(index=False):
-        o, e, lab = norm_path(row.orig), norm_path(row.extracted), int(row.label)
-        pred_pos = (o, e) in preds
-        if lab == 1 and pred_pos: TP += 1
-        elif lab == 1 and not pred_pos: FN += 1
-        elif lab == 0 and pred_pos: FP += 1
-        else: TN += 1
-    return TP, FP, FN, TN
+def read_labels_csv(p: Path) -> pd.DataFrame:
+    df = pd.read_csv(p, encoding="utf-8-sig")
+    # 라벨 스키마 정규화
+    if not {"orig_path", "extracted_path", "label"} <= set(df.columns):
+        # 호환 별칭 지원
+        alt_maps = [
+            {"orig": "orig_path", "extracted": "extracted_path"},
+            {"or_path": "orig_path", "ex_path": "extracted_path"},
+        ]
+        for m in alt_maps:
+            if set(m.keys()) <= set(df.columns) and "label" in df.columns:
+                df = df.rename(columns=m)
+                break
 
-def metrics(TP: int, FP: int, FN: int, TN: int):
-    prec = TP / (TP + FP) if TP + FP else 0.0
-    rec  = TP / (TP + FN) if TP + FN else 0.0
-    acc  = (TP + TN) / (TP + FP + FN + TN) if TP + FP + FN + TN else 0.0
-    f1   = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
-    return prec, rec, acc, f1
+    if not {"orig_path", "extracted_path", "label"} <= set(df.columns):
+        raise ValueError("labels-csv는 'orig_path','extracted_path','label' 컬럼(또는 호환 별칭)이 필요합니다.")
 
-def ci_proportion(p: float, n: int, z: float = 1.96):
-    """Wilson score interval [lo, hi]."""
-    if n == 0:
-        return 0.0, 0.0
-    denom = 1 + z**2 / n
-    centre = p + z**2 / (2 * n)
-    dev = z * math.sqrt(p * (1 - p) / n + z**2 / (4 * n**2))
-    lo = max(0.0, (centre - dev) / denom)
-    hi = min(1.0, (centre + dev) / denom)
-    return lo, hi
+    df = df.reset_index(drop=True)
+    df["label"] = df["label"].astype(int)
+    df["orig_b"] = df["orig_path"].astype(str).map(_basename).to_numpy()
+    df["extr_b"] = df["extracted_path"].astype(str).map(_basename).to_numpy()
+    return df[["orig_path", "extracted_path", "label", "orig_b", "extr_b"]]
 
 
-# ─────────────── Collisions ───────────────
-def find_collisions(mapping: Dict[str, str]) -> pd.DataFrame:
-    """1:N(N:1) 충돌 목록 반환."""
-    inv = defaultdict(list)  # extracted -> [orig...]
-    for o, e in mapping.items():
-        inv[norm_path(e)].append(norm_path(o))
-    rows = []
-    for e, origins in inv.items():
-        if len(origins) > 1:
-            for o in origins:
-                rows.append({"type": "extracted_used_by_multiple", "extracted": e, "original": o})
-    fwd = defaultdict(list)  # original -> [extracted...]
-    for o, e in mapping.items():
-        fwd[norm_path(o)].append(norm_path(e))
-    for o, exs in fwd.items():
-        if len(exs) > 1:
-            for e in exs:
-                rows.append({"type": "original_mapped_to_multiple", "original": o, "extracted": e})
-    return pd.DataFrame(rows)
+def read_meta_targets(preprocess_mapping_json: Optional[Path]) -> Optional[int]:
+    if not preprocess_mapping_json or not preprocess_mapping_json.is_file():
+        return None
+    mp = json.loads(preprocess_mapping_json.read_text("utf-8"))
+    # 카테고리 'reference'의 고유 원본_전체_경로 수를 타깃 수로 본다.
+    refs = set()
+    for _name, meta in mp.items():
+        if str(meta.get("카테고리", "")).lower() == "reference":
+            origin = meta.get("원본_전체_경로")
+            if origin:
+                refs.add(origin)
+    return len(refs) if refs else None
 
 
-# ─────────────── Track-wise ───────────────
-def build_origin_track_index(meta_json: Path) -> Dict[str, Set[str]]:
-    """preprocess_mapping.json → origin(norm) -> {tracks}"""
-    mp = json.loads(meta_json.read_text(encoding="utf-8"))
-    idx: Dict[str, Set[str]] = defaultdict(set)
-    for m in mp.values():
-        o = norm_path(m.get("원본_전체_경로", ""))
-        trk = str(m.get("트랙", "")).lower()
-        if o and trk:
-            idx[o].add(trk)
-    return idx
+# ──────────────────────────────── 평가 로직 ────────────────────────────────
+def compute_metrics(mapping_df: pd.DataFrame, labels_df: Optional[pd.DataFrame]) -> Dict:
+    total_pred = len(mapping_df)
+    tp = fp = fn = None
+    prec = rec = f1 = None
+    labeled_join = None
+    pos_total = None
 
-def per_track_metrics(labels: pd.DataFrame, mapping: Dict[str, str],
-                      origin_tracks: Dict[str, Set[str]]) -> pd.DataFrame:
-    rows = []
-    for track in ("low", "high"):
-        mask = labels["orig"].apply(lambda s: track in origin_tracks.get(norm_path(s), set()))
-        sub = labels[mask].copy()
-        TP, FP, FN, TN = confusion_from_labels_df(sub, mapping)
-        prec, rec, acc, f1 = metrics(TP, FP, FN, TN)
-        rows.append(dict(track=track, TP=TP, FP=FP, FN=FN, TN=TN,
-                         precision=prec, recall=rec, accuracy=acc, f1=f1, n_labels=len(sub)))
-    return pd.DataFrame(rows)
+    if labels_df is not None and not labels_df.empty:
+        labeled_join = mapping_df.merge(
+            labels_df[["orig_b", "extr_b", "label"]],
+            on=["orig_b", "extr_b"],
+            how="left",
+        )
 
+        # 라벨 있는 항목만으로 TP/FP 계산
+        has_y = labeled_join["label"].notna()
+        labeled_pred = labeled_join[has_y].copy()
+        if not labeled_pred.empty:
+            tp = int((labeled_pred["label"] == 1).sum())
+            fp = int((labeled_pred["label"] == 0).sum())
 
-# ─────────────── Diagnostics (labels+scores) ───────────────
-def join_labels_scores(labels: pd.DataFrame, scores: pd.DataFrame) -> pd.DataFrame:
-    """key_full 우선, 실패 시 key_base로 폴백."""
-    df = labels.merge(scores, on="key_full", how="left")
-    if df["score"].isna().all():
-        df = labels.merge(scores, on="key_base", how="left")
-    return df
+        # 전체 라벨 양성 수(분모용)
+        pos_total = int((labels_df["label"] == 1).sum())
+        if pos_total and tp is not None:
+            fn = pos_total - tp
 
-def sweep_threshold(y_true: np.ndarray, y_score: np.ndarray, steps: int = 201) -> pd.DataFrame:
-    thr_list = np.linspace(0.0, 1.0, steps)
-    rows = []
-    P = int(np.sum(y_true == 1))
-    N = int(np.sum(y_true == 0))
-    for t in thr_list:
-        pred = (y_score >= t).astype(int)
-        TP = int(np.sum((pred == 1) & (y_true == 1)))
-        FP = int(np.sum((pred == 1) & (y_true == 0)))
-        FN = int(np.sum((pred == 0) & (y_true == 1)))
-        TN = int(np.sum((pred == 0) & (y_true == 0)))
-        prec = TP / (TP + FP) if TP + FP else 0.0
-        rec  = TP / (TP + FN) if TP + FN else 0.0
-        f1   = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
-        tpr  = TP / P if P else 0.0
-        fpr  = FP / N if N else 0.0
-        rows.append(dict(thr=t, precision=prec, recall=rec, f1=f1, tpr=tpr, fpr=fpr, tp=TP, fp=FP, fn=FN, tn=TN))
-    return pd.DataFrame(rows)
+        # metrics
+        if tp is not None and fp is not None:
+            prec = tp / (tp + fp) if (tp + fp) > 0 else None
+        if tp is not None and fn is not None:
+            rec = tp / (tp + fn) if (tp + fn) > 0 else None
+        if prec is not None and rec is not None and (prec + rec) > 0:
+            f1 = 2 * prec * rec / (prec + rec)
 
-def plot_pr_roc(sweep: pd.DataFrame) -> None:
-    plt.figure()
-    plt.plot(sweep["recall"], sweep["precision"])
-    plt.xlabel("Recall"); plt.ylabel("Precision")
-    plt.title("Precision–Recall curve")
-    plt.tight_layout()
-    plt.savefig("pr_curve.png", dpi=200)
-
-    plt.figure()
-    plt.plot(sweep["fpr"], sweep["tpr"])
-    plt.xlabel("FPR"); plt.ylabel("TPR")
-    plt.title("ROC curve")
-    plt.tight_layout()
-    plt.savefig("roc_curve.png", dpi=200)
+    return {
+        "pred_pairs": total_pred,
+        "tp": tp, "fp": fp, "fn": fn,
+        "precision": prec, "recall": rec, "f1": f1,
+        "pos_total": pos_total,
+    }
 
 
-# ─────────────── Active learning (no labels) ───────────────
-def active_learning(scores_df: pd.DataFrame, n: int) -> pd.DataFrame:
-    if scores_df.empty:
+def make_suggestions(scores_df: pd.DataFrame,
+                     mapping_df: pd.DataFrame,
+                     labels_df: Optional[pd.DataFrame],
+                     top_n: int) -> pd.DataFrame:
+    if top_n <= 0 or scores_df is None or scores_df.empty:
         return pd.DataFrame()
-    center = None
-    thr_path = Path("thresholds.json")
-    if thr_path.is_file():
-        try:
-            center = float(json.loads(thr_path.read_text(encoding="utf-8")).get("orb_score", 0.0)) or None
-        except Exception:
-            center = None
-    if center is None:
-        center = float(scores_df["score"].median())
 
-    sdf = scores_df.copy()
-    sdf["abs_gap"] = (sdf["score"] - center).abs()
-    cols = [c for c in ["orig", "extracted", "score", "inliers", "kpA"] if c in sdf.columns]
-    rec = sdf.sort_values("abs_gap").head(n)[cols]
-    rec.to_csv("to_label.csv", index=False, encoding="utf-8-sig")
-    print(f"[SUGGEST] wrote {len(rec)} rows to to_label.csv")
-    return rec
+    # 이미 매핑에 들어간 (orig_b, extr_b)는 제외
+    mapped_keys = set(zip(mapping_df["orig_b"], mapping_df["extr_b"]))
+    mask_not_mapped = ~scores_df.set_index(["orig_b", "extr_b"]).index.isin(mapped_keys)
+    cand = scores_df[mask_not_mapped].copy()
+
+    # 라벨이 있으면 음성(0) 라벨은 제외
+    if labels_df is not None and not labels_df.empty:
+        lab = labels_df[["orig_b", "extr_b", "label"]].copy()
+        cand = cand.merge(lab, on=["orig_b", "extr_b"], how="left")
+        cand = cand[(cand["label"].isna()) | (cand["label"] == 1)]
+        cand = cand.drop(columns=["label"])
+
+    # 점수 높은 순으로 Top-N
+    cand = cand.sort_values(["score", "inliers", "kpA", "kpB"], ascending=[False, False, False, False])
+    return cand.head(top_n).reset_index(drop=True)
 
 
-# ─────────────── CLI ───────────────
+# ──────────────────────────────── CLI ────────────────────────────────
 def parse_args() -> argparse.Namespace:
-    pa = argparse.ArgumentParser(description="Evaluate (or suggest labels for) mapping")
-    pa.add_argument("--mapping-json", default="mapping_result.json")
-    pa.add_argument("--scores-csv", default=None)
-    pa.add_argument("--labels-csv", default=None)
-    pa.add_argument("--mapping-meta", default=None)
-    pa.add_argument("--suggest-n", type=int, default=20)
-    return pa.parse_args()
+    ap = argparse.ArgumentParser(
+        description="Evaluate mapping_result.json against labels and scores, with robust CSV schema handling.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    ap.add_argument("--mapping-json", required=True, help="mapping_result.json")
+    ap.add_argument("--scores-csv", required=True, help="pair_scores.csv")
+    ap.add_argument("--labels-csv", required=False, help="hand_label.csv")
+    ap.add_argument("--mapping-meta", required=False, help="preprocess_mapping.json (to count reference targets)")
+    ap.add_argument("--suggest-n", type=int, default=0, help="export top-N suggestions from scores (not already mapped)")
+    return ap.parse_args()
 
 
-# ─────────────── Main ───────────────
 def main():
     args = parse_args()
-    mapping = load_mapping(Path(args.mapping_json))
+    p_map = Path(args.mapping_json)
+    p_scores = Path(args.scores_csv)
+    p_labels = Path(args.labels_csv) if args.labels_csv else None
+    p_meta = Path(args.mapping_meta) if args.mapping_meta else None
 
-    # Collisions
-    col_df = find_collisions(mapping)
-    if not col_df.empty:
-        col_df.to_csv("collisions.csv", index=False, encoding="utf-8-sig")
+    # 읽기
+    mapping_df = read_mapping_json(p_map)
+    scores_df = read_scores_csv(p_scores)
+    labels_df = read_labels_csv(p_labels) if p_labels and p_labels.is_file() else None
 
-    labeled = False
-    TP = FP = FN = TN = 0
-    prec = rec = acc = f1 = 0.0
-    prec_ci = (0.0, 0.0)
-    rec_ci = (0.0, 0.0)
-    metrics_track_df = None
+    # 평가
+    metrics = compute_metrics(mapping_df, labels_df)
 
-    # Labels path
-    if args.labels_csv and Path(args.labels_csv).is_file():
-        labeled = True
-        labels = load_labels_df(Path(args.labels_csv))
-        TP, FP, FN, TN = confusion_from_labels_df(labels, mapping)
-        prec, rec, acc, f1 = metrics(TP, FP, FN, TN)
-        n_pos = TP + FN
-        n_pred_pos = TP + FP
-        prec_ci, rec_ci = ci_proportion(prec, n_pred_pos), ci_proportion(rec, n_pos)
+    # 타깃 개수(옵션)
+    total_targets = read_meta_targets(p_meta)
 
-        # Per-track (optional)
-        if args.mapping_meta and Path(args.mapping_meta).is_file():
-            idx = build_origin_track_index(Path(args.mapping_meta))
-            metrics_track_df = per_track_metrics(labels, mapping, idx)
-            metrics_track_df.to_csv("metrics_by_track.csv", index=False, encoding="utf-8-sig")
+    # 커버리지(라벨/메타 기준)
+    coverage_ref = None
+    if total_targets:
+        # reference 타깃 대비 커버리지
+        coverage_ref = len(mapping_df["orig"].unique()) / total_targets
 
-        # Diagnostics with scores
-        if args.scores_csv and Path(args.scores_csv).is_file():
-            scores = read_scores_csv(Path(args.scores_csv))
-            dfj = join_labels_scores(labels, scores)
+    coverage_lab = None
+    if labels_df is not None:
+        # 라벨이 있는 원본 대비 커버리지
+        coverage_lab = len(
+            pd.Series(mapping_df["orig_b"].unique()).isin(labels_df["orig_b"].unique())
+        ) / len(set(labels_df["orig_b"]))
 
-            # 산포도(정답/오답 시각 점검)
-            plt.figure()
-            ok = dfj[dfj["label"] == 1]
-            ng = dfj[dfj["label"] == 0]
-            plt.scatter(ok["score"], ok.get("inliers", pd.Series([0]*len(ok))), label="Label=1", marker="o")
-            plt.scatter(ng["score"], ng.get("inliers", pd.Series([0]*len(ng))), label="Label=0", marker="x")
-            plt.xlabel("ORB score"); plt.ylabel("Inliers")
-            plt.legend(); plt.tight_layout()
-            plt.savefig("error_scatter.png", dpi=200)
-            dfj.to_html("error_pairs.html", index=False)
+    # 제안 생성
+    sugg_df = make_suggestions(scores_df, mapping_df, labels_df, args.suggest_n)
+    out_dir = p_map.parent
+    report_path = out_dir / "evaluation_report.json"
+    sugg_path = out_dir / f"suggestions_top{args.suggest_n}.csv" if args.suggest_n > 0 else None
+    if sugg_path is not None and not sugg_df.empty:
+        sugg_df.to_csv(sugg_path, index=False, encoding="utf-8-sig")
 
-            if "score" in dfj.columns and dfj["score"].notna().any():
-                y_true = dfj["label"].astype(int).to_numpy()
-                y_score = dfj["score"].fillna(0.0).astype(float).to_numpy()
-                sweep = sweep_threshold(y_true, y_score)
-                sweep.to_csv("threshold_sweep.csv", index=False, encoding="utf-8-sig")
-                plot_pr_roc(sweep)
-                best = sweep.sort_values("f1", ascending=False).head(1).iloc[0]
-                print(f"[THRESHOLD] F1-max threshold = {best['thr']:.3f}  "
-                      f"(P={best['precision']:.3f}, R={best['recall']:.3f})")
+    # 리포트 저장
+    report = {
+        "summary": {
+            "pred_pairs": metrics["pred_pairs"],
+            "tp": metrics["tp"],
+            "fp": metrics["fp"],
+            "fn": metrics["fn"],
+            "precision": metrics["precision"],
+            "recall": metrics["recall"],
+            "f1": metrics["f1"],
+        },
+        "coverage": {
+            "reference_targets_total": total_targets,
+            "coverage_by_reference": coverage_ref,
+            "coverage_by_labels": coverage_lab,
+        },
+        "files": {
+            "mapping_json": str(p_map),
+            "scores_csv": str(p_scores),
+            "labels_csv": str(p_labels) if p_labels else None,
+            "report_json": str(report_path),
+            "suggestions_csv": str(sugg_path) if sugg_path and sugg_df is not None else None,
+        },
+    }
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    # Report
-    md = Path("evaluation_report.md")
-    with md.open("w", encoding="utf-8") as f:
-        f.write("# Mapping Evaluation Report\n\n")
-        if labeled:
-            f.write("| Metric | Value | 95% CI |\n|---|---|---|\n")
-            f.write(f"| Precision | {prec:.3f} | {prec_ci[0]:.3f}–{prec_ci[1]:.3f} |\n")
-            f.write(f"| Recall | {rec:.3f} | {rec_ci[0]:.3f}–{rec_ci[1]:.3f} |\n")
-            f.write(f"| F1 | {f1:.3f} |  |\n")
-            f.write(f"| Accuracy | {acc:.3f} |  |\n")
+    # ── 콘솔 출력 ──
+    print("===== EVALUATION SUMMARY =====")
+    print(f"Predicted pairs (mapping): {metrics['pred_pairs']}")
+    if metrics["tp"] is not None:
+        print(f"TP: {metrics['tp']}  FP: {metrics['fp']}  FN: {metrics['fn']}")
+        print(f"Precision: {metrics['precision']:.4f}  Recall: {metrics['recall']:.4f}  F1: {metrics['f1']:.4f}")
+    else:
+        print("(No labels provided or matched; precision/recall not computed)")
 
-            f.write("\n## Confusion Matrix\n")
-            f.write("| | Pred+ | Pred- |\n|---|---|---|\n")
-            f.write(f"| Actual+ | {TP} | {FN} |\n")
-            f.write(f"| Actual- | {FP} | {TN} |\n")
+    if total_targets is not None:
+        print(f"Reference targets total: {total_targets}")
+        if coverage_ref is not None:
+            print(f"Coverage (by reference targets): {coverage_ref*100:.2f}%")
+    if coverage_lab is not None:
+        print(f"Coverage (by labeled originals): {coverage_lab*100:.2f}%")
 
-            if metrics_track_df is not None and not metrics_track_df.empty:
-                f.write("\n## Per-Track Metrics (see metrics_by_track.csv)\n")
-                for r in metrics_track_df.to_dict("records"):
-                    f.write(f"- {r['track']}: P={r['precision']:.3f}, R={r['recall']:.3f}, "
-                            f"F1={r['f1']:.3f}, n={r['n_labels']}\n")
+    if args.suggest_n > 0:
+        if sugg_df is not None and not sugg_df.empty:
+            print(f"[SUGGEST] Top-{args.suggest_n} candidates exported → {sugg_path}")
+            # 상위 5개만 미리보기
+            preview = sugg_df[["orig", "extracted", "score", "inliers", "kpA", "kpB"]].head(min(5, len(sugg_df)))
+            print(preview.to_string(index=False))
         else:
-            f.write("No labels supplied — produced active-learning suggestions (if scores provided).\n")
+            print("[SUGGEST] No suggestions (empty or insufficient scores).")
 
-        f.write("\n## Collisions\n")
-        if col_df.empty:
-            f.write("No 1:N or N:1 collisions detected.\n")
-        else:
-            n_rows = len(col_df)
-            n_ex = (col_df['type'] == 'extracted_used_by_multiple').sum()
-            n_or = (col_df['type'] == 'original_mapped_to_multiple').sum()
-            f.write(f"{n_rows} collision rows written to **collisions.csv** "
-                    f"(extracted_used_by_multiple={n_ex}, original_mapped_to_multiple={n_or}).\n")
-
-        f.write("\n## Coverage\n")
-        f.write(f"Total mapped pairs: {len(mapping)}\n")
-
-    print(f"[REPORT] saved {md}")
-
-    # No-label path: suggestions
-    if not labeled and args.scores_csv and Path(args.scores_csv).is_file():
-        scores = read_scores_csv(Path(args.scores_csv))
-        active_learning(scores, args.suggest_n)
+    print(f"[SAVE] {report_path}")
+    print("[DONE] evaluation complete.")
 
 
 if __name__ == "__main__":

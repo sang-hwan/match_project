@@ -1,28 +1,28 @@
 # 4_verify_mapping.py
 """
-Verify 1:1 mapping ORIGINAL → EXTRACTED using ORB+RANSAC scores.
+최종 1:1 매핑 산출기 (자동 폴더 생성 반영)
 
-Inputs : candidates.json, preprocess_mapping.json, (opt) thresholds.json
-Outputs: mapping_result.json, pair_scores.csv, unmatched.json, logs
+기능 요약
+- candidates.json의 각 타깃(original_path)과 후보(extracted) 전부를 ORB+RANSAC으로 스코어링
+- 임계값(orb-score, min-inliers, min-inlier-ratio)로 필터링
+- 점수 내림차순 탐욕(greedy)으로 1:1 매핑 선정(동점은 inliers -> kpA -> kpB)
+- pair_scores.csv와 mapping_result.json 출력
+- 저장 경로의 부모 폴더를 자동 생성
 
-Example:
-python 4_verify_mapping.py ^
-  -c candidates.json ^
-  -m preprocess_mapping.json ^
-  -i processed ^
-  -o mapping_result.json ^
-  --scores-csv pair_scores.csv ^
-  --thresholds thresholds.json ^
-  --workers 8
+핵심 변경점
+- candidates.json의 키가 'low|<원본경로>' 형태여도 info["original_path"]를 우선 사용
+- 전처리본 선택은 preprocess_mapping.json LUT 기반(카테고리/트랙/채널 일치)
+- --orb-threshold 또는 --thresholds JSON(orb_score)을 사용 가능 (둘 다 있으면 --orb-threshold 우선)
+- --color-first로 color 우선 사용(기본은 gray 우선)
+- 저장 직전에 출력 경로의 부모 폴더 자동 생성
 """
-
-from __future__ import annotations
 
 import argparse
 import json
-from multiprocessing import Pool, cpu_count
+import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Tuple, Optional, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cv2
 import numpy as np
@@ -31,267 +31,334 @@ from joblib import Memory
 from tqdm import tqdm
 
 cv2.setNumThreads(0)
-CACHE = Memory(".cache/verify_orb", verbose=0)
+DESC_CACHE = Memory(".cache/descriptors", verbose=0)
 
-# ─────────────── Path / IO ───────────────
-def norm_identity(p: str) -> str:
-    return str(Path(p)).replace("\\", "/").lower()
 
-def load_json(path: Path) -> dict:
-    with path.open(encoding="utf-8") as f:
-        return json.load(f)
+# ============== 유틸 ==============
+def norm_path(p: str) -> str:
+    return os.path.normpath(p).lower()
 
-def save_json(obj, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
 
-def read_thresholds(thr_path: Optional[Path]) -> Optional[float]:
-    if thr_path and thr_path.is_file():
-        try:
-            val = float(load_json(thr_path).get("orb_score", 0.0))
-            return val if val > 0 else None
-        except Exception:
-            return None
-    return None
-
-# ─────────────── Mapping lookup ───────────────
-def norm_channel(ch: str) -> str:
-    t = str(ch).strip().lower()
-    if t in {"gray", "grey", "그레이"}: return "gray"
-    if t in {"color", "colour", "컬러"}: return "color"
-    return t
-
-def build_lookup(mapping: dict) -> Dict[str, Dict[Tuple[str, str, str], str]]:
-    """
-    identity(original full-path, normalized) ->
-        {(category, track, channel): relative_preproc_path}
-    """
-    lut: Dict[str, Dict[Tuple[str, str, str], str]] = {}
-    for proc_fname, meta in mapping.items():
-        origin = norm_identity(meta["원본_전체_경로"])
-        track = str(meta["트랙"]).lower()
-        channel = norm_channel(meta["채널"])
-        category = "extracted" if "bindata" in origin else "original"
-        rel = f"{category}/{track}/{channel}/{proc_fname}"
-        lut.setdefault(origin, {})[(category, track, channel)] = rel
-    return lut
-
-def pick_preproc(origin: str, preferred_cat: str, track: str, prefer_gray: bool,
-                 lut: Dict[str, Dict[Tuple[str, str, str], str]]) -> Optional[str]:
-    key = norm_identity(origin)
-    options = lut.get(key, {})
-    if not options:
+def safe_imread(path: str, flag=cv2.IMREAD_GRAYSCALE):
+    if not path or not os.path.exists(path):
         return None
-    order = ["gray", "color"] if prefer_gray else ["color", "gray"]
-    # same category first
-    for ch in order:
-        tup = (preferred_cat, track, ch)
-        if tup in options:
-            return options[tup]
-    # opposite category fallback (same track)
-    for (cat, trk, ch), rel in options.items():
-        if trk == track and ch in order:
-            return rel
-    return None
-
-# ─────────────── Robust image loading & features ───────────────
-def _safe_imread_gray(p: Path) -> Optional[np.ndarray]:
-    if not p.is_file():
-        return None
+    img = cv2.imread(path, flag)
+    if img is not None:
+        return img
+    # 윈도우 한글 경로 대응
     try:
-        buf = np.fromfile(str(p), np.uint8)
-        return cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
+        buf = np.fromfile(path, dtype=np.uint8)
+        return cv2.imdecode(buf, flag)
     except Exception:
         return None
 
-@CACHE.cache
-def _extract_orb(path_str: str, nfeat: int):
-    img = _safe_imread_gray(Path(path_str))
+
+# ============== ORB + RANSAC ==============
+@DESC_CACHE.cache
+def extract_orb(path: str, n: int = 1500):
+    img = safe_imread(path, cv2.IMREAD_GRAYSCALE)
     if img is None:
-        return np.zeros((0, 2), np.float32), None
-    orb = cv2.ORB_create(nfeatures=nfeat, fastThreshold=10)
+        return np.empty((0, 2), dtype=np.float32), None
+    orb = cv2.ORB_create(nfeatures=n)
     kps, des = orb.detectAndCompute(img, None)
-    pts = np.float32([kp.pt for kp in (kps or [])])
+    pts = np.float32([kp.pt for kp in kps]) if kps else np.empty((0, 2), dtype=np.float32)
     return pts, des
 
-def _match_orb(desA, desB, ratio: float) -> List[cv2.DMatch]:
-    if desA is None or desB is None:
-        return []
+
+def orb_score(a: str, b: str, nfeatures: int = 1500, ratio: float = 0.75, ransac_thresh: float = 5.0) -> Tuple[int, int, int]:
+    ptsA, desA = extract_orb(a, n=nfeatures)
+    ptsB, desB = extract_orb(b, n=nfeatures)
+    if desA is None or desB is None or len(desA) == 0 or len(desB) == 0:
+        return 0, len(ptsA), len(ptsB)
+
     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-    m = bf.knnMatch(desA, desB, k=2)
-    return [a for a, b in m if b is not None and a.distance < ratio * b.distance]
+    matches = bf.knnMatch(desA, desB, k=2)
+    good = [m for m, n in matches if n is not None and m.distance < ratio * n.distance]
+    if len(good) < 4:
+        return 0, len(ptsA), len(ptsB)
 
-def _ransac_inliers(ptsA, ptsB, matches: List[cv2.DMatch], ransac_thresh: float, min_matches: int) -> Tuple[int, float]:
-    if len(matches) < min_matches:
-        return 0, 0.0
-    src = np.float32([ptsA[m.queryIdx] for m in matches])
-    dst = np.float32([ptsB[m.trainIdx] for m in matches])
-    _, mask = cv2.findHomography(src, dst, cv2.RANSAC, ransac_thresh)
-    if mask is None:
-        return 0, 0.0
-    inl = int(mask.sum())
-    return inl, inl / max(len(matches), 1)
+    src = np.float32([ptsA[m.queryIdx] for m in good]).reshape(-1, 1, 2)
+    dst = np.float32([ptsB[m.trainIdx] for m in good]).reshape(-1, 1, 2)
+    _H, mask = cv2.findHomography(src, dst, cv2.RANSAC, ransac_thresh)
+    inliers = int(mask.sum()) if mask is not None else 0
+    return inliers, len(ptsA), len(ptsB)
 
-def pair_score(a_path: str, b_path: str, nfeatures: int, lowe_ratio: float,
-               ransac_thresh: float, min_matches: int) -> Tuple[int, int, int, float, float]:
-    """
-    Returns (inliers, kpA, kpB, inlier_ratio, score); score = inliers / kpA
-    """
-    ptsA, desA = _extract_orb(a_path, nfeat=nfeatures)
-    ptsB, desB = _extract_orb(b_path, nfeat=nfeatures)
-    kpA, kpB = len(ptsA), len(ptsB)
-    if kpA == 0 or kpB == 0:
-        return 0, kpA, kpB, 0.0, 0.0
-    good = _match_orb(desA, desB, lowe_ratio)
-    inl, ratio = _ransac_inliers(ptsA, ptsB, good, ransac_thresh, min_matches)
-    score = inl / (kpA + 1e-6)
-    return inl, kpA, kpB, ratio, float(score)
 
-# ─────────────── Candidate expansion ───────────────
-def iter_candidate_pairs(candidates: dict, lut: Dict[str, Dict[Tuple[str, str, str], str]],
-                         img_root: Path, gray_first: bool = True) -> Iterable[Tuple[str, str, str, str, str]]:
+# ============== LUT (preprocess_mapping.json) ==============
+def build_lookup(pre_map: Dict, images_root: Path) -> Dict[str, Dict[Tuple[str, str, str], str]]:
     """
-    Yield (orig_path, ex_path, track, orig_img_abs, ex_img_abs)
-    All pairs normalized to ORIGINAL → EXTRACTED.
+    identity(원본_전체_경로 정규화) -> {(category(extracted|reference), track(low|high), channel(gray|color)): relative processed path}
     """
-    for key_origin, info in candidates.items():
+    lut: Dict[str, Dict[Tuple[str, str, str], str]] = {}
+    for proc_name, meta in pre_map.items():
+        origin = meta.get("원본_전체_경로")
+        cat = str(meta.get("카테고리")).lower()
+        trk = str(meta.get("트랙")).lower()
+        ch = str(meta.get("채널")).lower()
+        if origin is None or cat not in ("extracted", "reference"):
+            raise ValueError("preprocess_mapping.json: '원본_전체_경로' 또는 '카테고리'가 누락/오류입니다.")
+        rel = f"{cat}/{trk}/{ch}/{proc_name}"
+        lut.setdefault(norm_path(origin), {})[(cat, trk, ch)] = rel
+    return lut
+
+
+def category_of_identity(identity_path: str, track: str, lut: Dict[str, Dict[Tuple[str, str, str], str]]) -> Optional[str]:
+    key = norm_path(identity_path)
+    options = lut.get(key, {})
+    cats = {c for (c, t, _), _rel in options.items() if t == track}
+    if "extracted" in cats:
+        return "extracted"
+    if "reference" in cats:
+        return "reference"
+    return None
+
+
+def pick_preprocessed(identity_path: str, track: str, prefer_gray: bool,
+                      lut: Dict[str, Dict[Tuple[str, str, str], str]], images_root: Path) -> Optional[str]:
+    """
+    동일 identity 내 (카테고리→트랙→채널) 우선순위로 전처리본 경로 반환.
+    없는 경우 None.
+    """
+    key = norm_path(identity_path)
+    options = lut.get(key, {})
+    if not options:
+        return None
+
+    cat = category_of_identity(identity_path, track, lut)
+    if cat is None:
+        return None
+
+    order = ["gray", "color"] if prefer_gray else ["color", "gray"]
+    for ch in order:
+        tup = (cat, track, ch)
+        if tup in options:
+            return str(images_root / options[tup])
+
+    # 동일 트랙 내 임의 채널 대체
+    for (c2, t2, ch2), rel in options.items():
+        if c2 == cat and t2 == track:
+            return str(images_root / rel)
+
+    return None
+
+
+# ============== 페어 생성 ==============
+def iter_candidate_pairs(candidates: Dict, lut: Dict[str, Dict[Tuple[str, str, str], str]]) -> Iterable[Tuple[str, str, str]]:
+    """
+    candidates.json -> (ex_identity, or_identity, track) 생성
+    - 원본 경로는 info["original_path"]를 우선 사용, 없으면 키에서 '|' 분리
+    - 카테고리는 LUT로 판별하여 extracted/reference를 구분
+    """
+    for key, info in candidates.items():
         track = str(info.get("track", "low")).lower()
-        key_cat = "extracted" if "bindata" in norm_identity(key_origin) else "original"
-
-        key_rel = pick_preproc(key_origin, key_cat, track, gray_first, lut) or \
-                  pick_preproc(key_origin, key_cat, track, not gray_first, lut)
-        if not key_rel:
+        origin_path = info.get("original_path") or (key.split("|", 1)[-1] if "|" in key else key)
+        items = info.get("candidates", [])
+        if not isinstance(items, list):
             continue
-        key_img = str(img_root / key_rel)
 
-        cand_list = info.get("candidates") or info.get("extracted_candidates") or []
-        for cand in cand_list:
-            cand_origin = cand.get("name")
-            if not cand_origin:
-                continue
-            cand_cat = "extracted" if "bindata" in norm_identity(cand_origin) else "original"
-            if cand_cat == key_cat:
+        for c in items:
+            name = c.get("name")
+            if not name:
                 continue
 
-            cand_rel = pick_preproc(cand_origin, cand_cat, track, gray_first, lut) or \
-                       pick_preproc(cand_origin, cand_cat, track, not gray_first, lut)
-            if not cand_rel:
+            ca = category_of_identity(origin_path, track, lut)
+            cb = category_of_identity(name, track, lut)
+            if ca is None or cb is None or ca == cb:
                 continue
-            cand_img = str(img_root / cand_rel)
 
-            if key_cat == "original" and cand_cat == "extracted":
-                yield key_origin, cand_origin, track, key_img, cand_img
+            if ca == "extracted" and cb == "reference":
+                ex, ori = origin_path, name
             else:
-                yield cand_origin, key_origin, track, cand_img, key_img
+                ex, ori = name, origin_path
+            yield (ex, ori, track)
 
-# ─────────────── Greedy 1:1 assignment ───────────────
-def greedy_assign(sorted_rows: List[dict]) -> Dict[str, str]:
-    matched_o: set[str] = set()
-    matched_e: set[str] = set()
-    mapping: Dict[str, str] = {}
-    for r in sorted_rows:
-        o, e = r["orig"], r["extracted"]
-        if o in matched_o or e in matched_e:
-            continue
-        matched_o.add(o)
-        matched_e.add(e)
-        mapping[o] = e
-    return mapping
 
-# ─────────────── Worker (top-level for multiprocessing) ───────────────
-def _score_task(t: Tuple[str, str, str, str, str, int, float, float, int]):
-    o, e, trk, op, ep, nfeat, lowe, rthr, min_matches = t
-    inl, kA, kB, ratio, score = pair_score(op, ep, nfeat, lowe, rthr, min_matches)
+# ============== 스코어링/필터/할당 ==============
+def resolve_threshold(args) -> float:
+    if args.orb_threshold is not None:
+        return float(args.orb_threshold)
+    if args.thresholds and Path(args.thresholds).is_file():
+        try:
+            js = json.loads(Path(args.thresholds).read_text("utf-8"))
+            val = js.get("orb_score", 0.0)
+            return float(val) if val is not None else 0.0
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def score_one(pair: Tuple[str, str, str], prefer_gray: bool, lut, images_root: Path,
+              nfeatures: int, ratio: float, ransac: float):
+    ex_id, or_id, track = pair
+    ex_used = pick_preprocessed(ex_id, track, prefer_gray, lut, images_root)
+    or_used = pick_preprocessed(or_id, track, prefer_gray, lut, images_root)
+
+    # 전처리본이 없으면 identity 원본 경로로 대체 시도
+    if ex_used is None:
+        ex_used = ex_id
+    if or_used is None:
+        or_used = or_id
+
+    inl, kA, kB = orb_score(ex_used, or_used, nfeatures=nfeatures, ratio=ratio, ransac_thresh=ransac)
+    score = inl / (kA + 1e-6)
     return dict(
-        orig=o, extracted=e, track=trk,
-        inliers=inl, kpA=kA, kpB=kB, inlier_ratio=ratio, score=score,
-        orig_img=op, extracted_img=ep
+        ex_id=Path(ex_id).name, or_id=Path(or_id).name,
+        ex_path=ex_id, or_path=or_id,
+        ex_used=str(ex_used), or_used=str(or_used),
+        track=track, inliers=inl, kpA=kA, kpB=kB, score=float(score),
     )
 
-# ─────────────── CLI ───────────────
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Verify 1:1 mapping by ORB+RANSAC over candidate pairs")
-    p.add_argument("-c", "--candidates", required=True, help="candidates.json")
-    p.add_argument("-m", "--mapping", required=True, help="preprocess_mapping.json")
-    p.add_argument("-i", "--img-root", required=True, help="root processed dir (contains extracted/original)")
-    p.add_argument("-o", "--output", default="mapping_result.json", help="output mapping JSON (ORIGINAL→EXTRACTED)")
-    p.add_argument("--scores-csv", default="pair_scores.csv", help="CSV of all scored pairs")
-    p.add_argument("--unmatched-json", default="unmatched.json", help="list of originals without assignment")
-    p.add_argument("--thresholds", default=None, help="thresholds.json (from 4_B_extract_threshold.py)")
-    p.add_argument("--orb-threshold", type=float, default=None, help="override ORB score threshold (inliers/kpA)")
-    p.add_argument("--min-inliers", type=int, default=6)
-    p.add_argument("--min-inlier-ratio", type=float, default=0.15)
-    p.add_argument("--min-matches", type=int, default=8, help="minimum good matches to run RANSAC")
-    p.add_argument("--orb-nfeatures", type=int, default=800)
-    p.add_argument("--lowe-ratio", type=float, default=0.75)
-    p.add_argument("--ransac-thresh", type=float, default=5.0)
-    p.add_argument("--workers", type=int, default=max(cpu_count() - 1, 1))
-    p.add_argument("--color-first", action="store_true", help="prefer color over gray (default: gray-first)")
-    return p.parse_args()
 
-# ─────────────── Main ───────────────
+def greedy_assign(rows: List[Dict]) -> List[Dict]:
+    """
+    점수 순 정렬 후 1:1 탐욕 할당.
+    동점 타이브레이커: inliers -> kpA -> kpB
+    """
+    rows_sorted = sorted(
+        rows,
+        key=lambda r: (r["score"], r["inliers"], r["kpA"], r["kpB"]),
+        reverse=True,
+    )
+    used_ex, used_or = set(), set()
+    chosen: List[Dict] = []
+    for r in rows_sorted:
+        if r["ex_path"] in used_ex or r["or_path"] in used_or:
+            continue
+        used_ex.add(r["ex_path"])
+        used_or.add(r["or_path"])
+        chosen.append(r)
+    return chosen
+
+
+# ============== CLI & MAIN ==============
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description="Create final 1:1 mapping using ORB+RANSAC scoring on candidate pairs",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    ap.add_argument("-c", "--candidates", required=True, help="candidates.json")
+    ap.add_argument("-m", "--mapping", default="preprocess_mapping.json")
+    ap.add_argument("-i", "--images-root", default="processed")
+    ap.add_argument("-o", "--output", default="mapping_result.json")
+    ap.add_argument("--scores-csv", default="pair_scores.csv")
+    ap.add_argument("--thresholds", default=None, help="thresholds.json (from 4_B)")
+    ap.add_argument("--orb-threshold", type=float, default=None, help="override orb score threshold")
+    ap.add_argument("--min-inliers", type=int, default=8)
+    ap.add_argument("--min-inlier-ratio", type=float, default=0.15)
+    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--color-first", action="store_true", help="prefer color over gray")
+    ap.add_argument("--orb-nfeatures", type=int, default=1500)
+    ap.add_argument("--lowe-ratio", type=float, default=0.75)
+    ap.add_argument("--ransac-thresh", type=float, default=5.0)
+    return ap.parse_args()
+
+
 def main():
     args = parse_args()
+    images_root = Path(args.images_root)
 
-    candidates = load_json(Path(args.candidates))
-    mapping_mp = load_json(Path(args.mapping))
-    lut = build_lookup(mapping_mp)
-    img_root = Path(args.img_root).resolve()
+    candidates = json.loads(Path(args.candidates).read_text("utf-8"))
+    pre_map = json.loads(Path(args.mapping).read_text("utf-8"))
+    lut = build_lookup(pre_map, images_root)
 
-    thr_json = read_thresholds(Path(args.thresholds)) if args.thresholds else None
-    orb_thr = args.orb_threshold if args.orb_threshold is not None else thr_json
-    print(f"[PARAM] ORB threshold: {orb_thr:.4f}" if orb_thr is not None else "[PARAM] ORB threshold: (none)")
+    prefer_gray = not args.color_first
+    orb_thr = resolve_threshold(args)
+    print(f"[PARAM] ORB threshold: {orb_thr:.4f}")
 
-    pairs = list(iter_candidate_pairs(candidates=candidates, lut=lut, img_root=img_root, gray_first=not args.color_first))
+    # 후보 페어 생성
+    pairs = list(iter_candidate_pairs(candidates, lut))
     print(f"[INFO] candidate pairs to score: {len(pairs):,}")
 
-    tasks = [
-        (o, e, trk, op, ep, args.orb_nfeatures, args.lowe_ratio, args.ransac_thresh, args.min_matches)
-        for (o, e, trk, op, ep) in pairs
-    ]
-
-    rows: List[dict] = []
-    with Pool(processes=args.workers) as pool:
-        for r in tqdm(pool.imap_unordered(_score_task, tasks), total=len(tasks), ncols=80, desc="Scoring"):
-            rows.append(r)
-
-    df = pd.DataFrame(rows)
-    if df.empty:
+    if not pairs:
+        print("Scoring: 0it [00:00, ?it/s]")
         print("[WARN] no scores computed; exiting.")
-        save_json({}, Path(args.output))
-        save_json([], Path(args.unmatched_json))
         return
 
-    df.sort_values(["score", "inliers"], ascending=[False, False], inplace=True)
+    # 스코어링 (멀티스레드)
+    rows: List[Dict] = []
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
+        futures = [
+            ex.submit(
+                score_one,
+                p, prefer_gray, lut, images_root,
+                args.orb_nfeatures, args.lowe_ratio, args.ransac_thresh
+            )
+            for p in pairs
+        ]
+        for f in tqdm(as_completed(futures), total=len(futures), ncols=80, desc="Scoring"):
+            r = f.result()
+            rows.append(r)
+
+    # CSV 저장(전체 페어) ─ 부모 폴더 자동 생성
+    Path(args.scores_csv).parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(rows)
     df.to_csv(args.scores_csv, index=False, encoding="utf-8-sig")
-    print(f"[SAVE] pair_scores.csv  rows={len(df):,}  → {args.scores_csv}")
+    print(f"[SAVE] {args.scores_csv}")
 
-    # Filters
-    mask = (df["inliers"] >= args.min_inliers) & (df["inlier_ratio"] >= args.min_inlier_ratio)
-    if orb_thr is not None:
-        mask &= (df["score"] >= float(orb_thr))
-    eligible = df[mask].copy()
-    print(f"[INFO] eligible pairs after filters: {len(eligible):,}")
+    # 필터링
+    def keep(r):
+        return (
+            r["score"] >= orb_thr and
+            r["inliers"] >= args.min_inliers and
+            (r["inliers"] / (r["kpA"] + 1e-6)) >= args.min_inlier_ratio
+        )
 
-    # Greedy 1:1 assignment (max score first)
-    eligible_sorted = eligible.sort_values(["score", "inliers"], ascending=[False, False]).to_dict("records")
-    mapping = greedy_assign(eligible_sorted)
+    filtered = [r for r in rows if keep(r)]
+    print(f"[INFO] passed threshold filter: {len(filtered):,}")
 
-    all_originals = {o for (o, _, _, _, _) in pairs}
-    unmatched = sorted(list(all_originals - set(mapping.keys())))
+    if not filtered:
+        # 빈 결과라도 폴더를 생성하고 저장
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.output).write_text(
+            json.dumps({"pairs": [], "map": {}, "meta": {"orb_threshold": orb_thr}}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"[WARN] no pairs passed; wrote empty result to {args.output}")
+        return
 
-    save_json(mapping, Path(args.output))
-    save_json(unmatched, Path(args.unmatched_json))
+    # 1:1 탐욕 할당
+    chosen = greedy_assign(filtered)
+    print(f"[INFO] assigned 1:1 pairs: {len(chosen):,}")
 
-    print("\n[SUMMARY]")
-    print(f"total ORIGINALs referenced : {len(all_originals)}")
-    print(f"matched                    : {len(mapping)}")
-    print(f"unmatched                  : {len(unmatched)}")
-    if unmatched[:10]:
-        print("first unmatched examples:")
-        for u in unmatched[:10]:
-            print("  -", u)
+    # 출력 구조: (1) 상세 리스트, (2) 간단 맵
+    out_pairs = [
+        {
+            "original_path": r["or_path"],
+            "extracted_path": r["ex_path"],
+            "score": r["score"],
+            "inliers": r["inliers"],
+            "kpA": r["kpA"],
+            "kpB": r["kpB"],
+            "track": r["track"],
+            "ex_used": r["ex_used"],
+            "or_used": r["or_used"],
+        }
+        for r in chosen
+    ]
+    out_map = {r["or_path"]: r["ex_path"] for r in chosen}
+
+    out_json = {
+        "pairs": out_pairs,
+        "map": out_map,
+        "meta": {
+            "orb_threshold": orb_thr,
+            "min_inliers": args.min_inliers,
+            "min_inlier_ratio": args.min_inlier_ratio,
+            "color_first": bool(args.color_first),
+        },
+        "stats": {
+            "scored_pairs": len(rows),
+            "passed_filter": len(filtered),
+            "assigned_pairs": len(chosen),
+        },
+    }
+
+    # JSON 저장 ─ 부모 폴더 자동 생성
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.output).write_text(json.dumps(out_json, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[SAVE] {args.output}")
+    print("[DONE] mapping complete.")
+
 
 if __name__ == "__main__":
     main()

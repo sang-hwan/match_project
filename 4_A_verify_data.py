@@ -56,19 +56,28 @@ def build_origin_index(mapping: Dict) -> Dict[str, List[Tuple[str, str]]]:
     return index
 
 
-def verify_candidates(
-    candidates: Dict, origin_index: Dict[str, List[Tuple[str, str]]]
+def verify_candidates(candidates: Dict, origin_index: Dict[str, List[Tuple[str, str]]]
 ) -> Tuple[List[str], List[str]]:
-    """Return lists of missing targets and missing candidate references."""
     missing_targets: List[str] = []
     missing_candidates: List[str] = []
 
-    for target_path, info in candidates.items():
-        if norm_path(target_path) not in origin_index:
-            missing_targets.append(target_path)
+    def norm_path(p: str) -> str:
+        return os.path.normpath(p).lower()
+
+    for target_key, info in candidates.items():
+        # 1) original_path 필드가 있으면 그것을 신뢰
+        target_origin = info.get("original_path")
+        # 2) 없으면 'low|<path>' 형태의 키에서 분리
+        if not target_origin:
+            target_origin = target_key.split("|", 1)[-1] if "|" in target_key else target_key
+
+        if norm_path(target_origin) not in origin_index:
+            missing_targets.append(target_key)
+
         for cand in info.get("candidates", []):
             if norm_path(cand.get("name", "")) not in origin_index:
                 missing_candidates.append(cand.get("name", ""))
+
     return missing_targets, missing_candidates
 
 
