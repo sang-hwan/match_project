@@ -1,12 +1,10 @@
 /.cache
-/feat_dist
-/identity_dist
+/artifacts
 /images_output
 /inspect_pairs
-/map_dist
+/inspect_pairs_hp
 /processed
 /venv
 *.json
 *.zip
 *.csv
-evaluation_report.md

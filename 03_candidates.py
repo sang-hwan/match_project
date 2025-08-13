@@ -1,9 +1,10 @@
-"""
+""" 
 03_candidates.py
 
 Build candidate pairs (reference -> extracted) using:
 - Stage-1: pHash(gray, low) within Hamming radius (BK-tree)
-- Stage-2: HSV histogram(color, low) using Bhattacharyya distance
+- Stage-2: HSV histogram(color, low) with **correct** Bhattacharyya distance
+- Optional low-cost **pre-filters** (aspect ratio from orig_wh, edge density on low/gray)
 Outputs candidates.json keyed by "low|<reference_src_relpath>"
 
 Usage
@@ -12,10 +13,12 @@ python 03_candidates.py EXTRACTED_OUT REFERENCE_OUT \
        --mapping preprocess_mapping.json \
        --out candidates.json \
        --cache .cache/features \
-       --phash-threshold 36 \
-       --hist-threshold 0.75 \
-       --min-cand-per-basis 8 \
-       --phash-step 2 --phash-max 48 \
+       --phash-threshold 28 \
+       --hist-threshold 0.70 \
+       --min-cand-per-basis 5 \
+       --phash-step 2 --phash-max 36 \
+       --prefilter-edge 0.30 \
+       --prefilter-aspect 0.50 \
        --verify \
        --workers 8
 
@@ -23,8 +26,9 @@ Notes
 -----
 - 입력은 02_preprocess.py가 생성한 출력 루트(=전처리본)와 매핑 JSON입니다.
 - pHash는 64bit 정수, HSV 히스토그램은 3D(16x8x8) 확률 벡터(합=1)입니다.
-- Bhattacharyya distance d = sqrt(1 - sum_i sqrt(p_i * q_i)), 0(유사) ~ 1(상이).
+- Bhattacharyya distance d = sqrt(max(0, 1 - sum_i sqrt(p_i) * sqrt(q_i))), 0(유사) ~ 1(상이).
 - CPU 환경 최적화를 위해 캐시(JSON)를 사용합니다. 부재 시 즉시 계산 후 저장합니다.
+- 출력 candidates.json의 구조(키/값)는 기존 04_match.py와 **호환**되도록 유지합니다.
 """
 
 from __future__ import annotations
@@ -33,7 +37,6 @@ import argparse
 import concurrent.futures as futures
 import json
 import math
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -127,15 +130,12 @@ def phash64(img_gray: np.ndarray) -> int:
     g = cv2.resize(g, (32, 32), interpolation=cv2.INTER_AREA).astype(np.float32)
     dct = cv2.dct(g)
     block = dct[:8, :8].copy()
-    # Exclude DC (0,0)
-    vals = block.flatten()
-    vals = vals[1:]
+    vals = block.flatten()[1:]  # exclude DC
     med = np.median(vals)
     bits = (vals > med).astype(np.uint8)
-    # pack 63 bits + 1 pad bit -> 64
+    # pack 63 bits + 1 pad bit -> 64 (MSB-first)
     pad = np.array([0], dtype=np.uint8)
     bits64 = np.concatenate([bits, pad])
-    # Compose into 64-bit int (MSB first)
     v = 0
     for b in bits64:
         v = (v << 1) | int(b)
@@ -159,14 +159,25 @@ def hsv_hist(img_bgr: np.ndarray, bins_h: int = 16, bins_s: int = 8, bins_v: int
     return hist.flatten()
 
 def bhattacharyya_distance(p: np.ndarray, q: np.ndarray) -> float:
-    # BC = sum sqrt(p_i*q_i)
-    # d = sqrt(max(0, 1 - BC))
-    bc = float(np.sum(np.sqrt(np.clip(p, 0, None) * np.sqrt(np.clip(q, 0, None)))))
-    if bc < 0:
+    """
+    Correct Bhattacharyya distance:
+      BC = sum_i sqrt(p_i) * sqrt(q_i)   (0..1)
+      d  = sqrt(max(0, 1 - BC))          (0..1, 0 is identical)
+    """
+    p = np.asarray(p, dtype=np.float32)
+    q = np.asarray(q, dtype=np.float32)
+    # Numerical safety
+    p = np.clip(p, 0.0, None)
+    q = np.clip(q, 0.0, None)
+    sp = np.sqrt(p)
+    sq = np.sqrt(q)
+    bc = float(np.sum(sp * sq))
+    # clamp
+    if bc < 0.0:
         bc = 0.0
     if bc > 1.0:
         bc = 1.0
-    d = math.sqrt(1.0 - bc)
+    d = math.sqrt(max(0.0, 1.0 - bc))
     return float(d)
 
 def hamming64(a: int, b: int) -> int:
@@ -209,28 +220,23 @@ class BKTree:
                 return
             node = nxt
 
-    def build(self, vals: Iterable[int]):
-        for v in vals:
-            self.add(v)
-
-    def search(self, query: int, radius: int) -> List[int]:
+    def query(self, val: int, radius: int) -> List[int]:
         """
-        Returns list of values within radius (inclusive).
+        Return all stored values within Hamming distance <= radius.
         """
         out: List[int] = []
         if self.root is None:
             return out
-        stk: List[BKNode] = [self.root]
+        stk: List[Tuple[BKNode, int]] = [(self.root, hamming64(val, self.root.val))]
         while stk:
-            node = stk.pop()
-            d = hamming64(query, node.val)
+            node, d = stk.pop()
             if d <= radius:
                 out.append(node.val)
             lo = max(0, d - radius)
             hi = d + radius
             for k, child in node.children.items():
                 if lo <= k <= hi:
-                    stk.append(child)
+                    stk.append((child, hamming64(val, child.val)))
         return out
 
 
@@ -239,7 +245,7 @@ class BKTree:
 # =========================
 
 def load_cache_json(path: Path) -> Optional[Dict[str, object]]:
-    if not path.exists():
+    if not path or not path.exists():
         return None
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -265,7 +271,7 @@ def build_feature_cache(paths: Dict[str, VariantPaths],
     """
     Returns:
       phash_map: {src_relpath: uint64_int}
-      hist_map:  {src_relpath: np.ndarray (H* S* V)}
+      hist_map:  {src_relpath: np.ndarray (H*S*V)}
     """
     # --- Load caches if available ---
     phash_cache_path = None
@@ -287,7 +293,10 @@ def build_feature_cache(paths: Dict[str, VariantPaths],
                 pass
     if hist_cache and hist_cache.get("bins_h") == bins_h and hist_cache.get("bins_s") == bins_s and hist_cache.get("bins_v") == bins_v:
         for k, arr in hist_cache["data"].items():
-            hist_map[k] = np.asarray(arr, dtype=np.float32)
+            try:
+                hist_map[k] = np.asarray(arr, dtype=np.float32)
+            except Exception:
+                pass
 
     # --- Compute missing ---
     todo_phash = []
@@ -308,8 +317,8 @@ def build_feature_cache(paths: Dict[str, VariantPaths],
         if img is None:
             return src_rel, None
         try:
-            v = phash64(img)
-            return src_rel, v
+            h = phash64(img)
+            return src_rel, h
         except Exception:
             return src_rel, None
 
@@ -324,16 +333,17 @@ def build_feature_cache(paths: Dict[str, VariantPaths],
         except Exception:
             return src_rel, None
 
+    # Multiprocessing is overkill for small CPU jobs; use ThreadPool
     if todo_phash:
-        with futures.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-            for src_rel, v in ex.map(_calc_phash, todo_phash):
-                if v is not None:
-                    phash_map[src_rel] = int(v)
+        with futures.ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
+            for src_rel, h in ex.map(_calc_phash, todo_phash):
+                if h is not None:
+                    phash_map[src_rel] = int(h)
     if todo_hist:
-        with futures.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        with futures.ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
             for src_rel, h in ex.map(_calc_hist, todo_hist):
                 if h is not None:
-                    hist_map[src_rel] = h
+                    hist_map[src_rel] = np.asarray(h, dtype=np.float32)
 
     # --- Save caches ---
     if cache_dir:
@@ -361,6 +371,70 @@ def build_feature_cache(paths: Dict[str, VariantPaths],
             })
 
     return phash_map, hist_map
+
+
+# =========================
+# --- Geometry metrics ----
+# =========================
+
+def compute_edge_density(path_gray_low: Path) -> Optional[float]:
+    img = imread_unicode(path_gray_low, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return None
+    try:
+        # light blur + Canny
+        img_blur = cv2.GaussianBlur(img, (3, 3), 0)
+        edges = cv2.Canny(img_blur, 50, 150)
+        ed = float(np.count_nonzero(edges)) / float(edges.size)
+        return ed
+    except Exception:
+        return None
+
+def build_geom_cache(paths: Dict[str, VariantPaths],
+                     which: str,
+                     track: str,
+                     cache_dir: Optional[Path],
+                     workers: int) -> Dict[str, Dict[str, float]]:
+    """
+    Returns:
+      geom_map: {src_relpath: {"edge_density": float}}
+    """
+    cache_path = None
+    if cache_dir:
+        cache_path = cache_dir / f"geom_{which}_{track}.json"
+
+    geom_map: Dict[str, Dict[str, float]] = {}
+    cache = load_cache_json(cache_path) if cache_path else None
+    if cache and cache.get("version") == 1:
+        for k, d in cache.get("data", {}).items():
+            try:
+                geom_map[k] = {"edge_density": float(d.get("edge_density", 0.0))}
+            except Exception:
+                pass
+
+    todo = []
+    for src_rel, vp in paths.items():
+        if src_rel not in geom_map:
+            p = getattr(vp, f"gray_{track}")
+            if p:
+                todo.append((src_rel, p))
+
+    if todo:
+        with futures.ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
+            for src_rel, ed in ex.map(lambda job: (job[0], compute_edge_density(job[1])), todo):
+                if ed is not None:
+                    geom_map[src_rel] = {"edge_density": float(ed)}
+
+    if cache_path:
+        save_cache_json(cache_path, {
+            "version": 1,
+            "feature": "geom",
+            "which": which,
+            "track": track,
+            "count": len(geom_map),
+            "data": geom_map,
+        })
+    return geom_map
 
 
 # =========================
@@ -403,14 +477,33 @@ def build_candidates(ex_paths: Dict[str, VariantPaths],
                      phash_ref: Dict[str, int],
                      hist_ex: Dict[str, np.ndarray],
                      hist_ref: Dict[str, np.ndarray],
+                     geom_ex: Dict[str, Dict[str, float]],
+                     geom_ref: Dict[str, Dict[str, float]],
+                     mp_raw: Dict,
                      phash_threshold: int,
                      hist_threshold: float,
                      min_cand_per_basis: int,
                      phash_step: int,
-                     phash_max: int) -> Dict[str, List[Candidate]]:
+                     phash_max: int,
+                     prefilter_aspect: Optional[float],
+                     prefilter_edge: Optional[float]) -> Tuple[Dict[str, List[Candidate]], Dict[str, object]]:
     """
-    Returns: mapping key "low|<ref_src_relpath>" -> [Candidate...]
+    Returns:
+      cand_map: mapping key "low|<ref_src_relpath>" -> [Candidate...]
+      stats:    summary information (counts, distributions)
     """
+    # Aspect ratio source from mapping (orig_wh)
+    orig_wh_ex: Dict[str, Tuple[int,int]] = {}
+    orig_wh_rf: Dict[str, Tuple[int,int]] = {}
+    for src_rel, info in mp_raw["by_src"]["extracted"].items():
+        w,h = info.get("orig_wh", [0,0])  # note: mapping uses [w,h]
+        if w and h:
+            orig_wh_ex[src_rel] = (int(w), int(h))
+    for src_rel, info in mp_raw["by_src"]["reference"].items():
+        w,h = info.get("orig_wh", [0,0])
+        if w and h:
+            orig_wh_rf[src_rel] = (int(w), int(h))
+
     # BK-tree on EXTRACTED pHash
     bkt = BKTree()
     # Also a reverse index: phash value -> list of src_rel (collisions rare but possible)
@@ -422,29 +515,76 @@ def build_candidates(ex_paths: Dict[str, VariantPaths],
     out: Dict[str, List[Candidate]] = {}
     ref_list = list(ref_paths.keys())
 
+    # Stats accumulators
+    cand_counts: List[int] = []
+    removed_by_aspect = 0
+    removed_by_edge   = 0
+
+    def aspect_ratio_of(src_rel: str, kind: str) -> Optional[float]:
+        wh = orig_wh_rf.get(src_rel) if kind == "ref" else orig_wh_ex.get(src_rel)
+        if not wh:
+            return None
+        w,h = wh
+        if w <= 0 or h <= 0:
+            return None
+        return float(w) / float(h)
+
     for i, ref_rel in enumerate(ref_list, 1):
+        key = f"low|{ref_rel}"
         ref_hash = phash_ref.get(ref_rel)
         ref_hist = hist_ref.get(ref_rel)
-        key = f"low|{ref_rel}"
-
         if ref_hash is None or ref_hist is None:
             out[key] = []
+            cand_counts.append(0)
             continue
 
-        # Stage-1: pHash neighbors within radius, widen until >= K or reach max
-        radius = phash_threshold
-        neigh_vals: List[int] = []
+        # Stage-1: pHash radius search (expand until min candidates or max radius)
+        radius = int(phash_threshold)
+        cand_rels: List[str] = []
         while True:
-            neigh_vals = bkt.search(ref_hash, radius)
-            # Map BK results to unique extracted rels
+            vals = bkt.query(ref_hash, radius)
             cand_rels = []
-            for hv in neigh_vals:
+            for hv in vals:
                 cand_rels.extend(phash_to_rel.get(hv, []))
-            cand_rels = list(dict.fromkeys(cand_rels))  # dedup preserve order
-
+            # unique
+            cand_rels = list(dict.fromkeys(cand_rels))
             if len(cand_rels) >= min_cand_per_basis or radius >= phash_max:
                 break
             radius = min(phash_max, radius + phash_step)
+
+        # Prefilter by aspect/edge (cheap)
+        if prefilter_aspect is not None or prefilter_edge is not None:
+            rf_ar = aspect_ratio_of(ref_rel, "ref")
+            rf_ed = geom_ref.get(ref_rel, {}).get("edge_density", None)
+            filtered: List[str] = []
+            for ex_rel in cand_rels:
+                ok = True
+                if prefilter_aspect is not None and rf_ar is not None:
+                    ex_ar = aspect_ratio_of(ex_rel, "ex")
+                    if ex_ar is not None:
+                        # accept if |log(ar_ex/ar_rf)| <= prefilter_aspect
+                        if abs(math.log(max(1e-6, ex_ar) / max(1e-6, rf_ar))) > prefilter_aspect:
+                            ok = False
+                    # if ex_ar is None, cannot judge -> keep
+                if ok and prefilter_edge is not None and rf_ed is not None:
+                    ex_ed = geom_ex.get(ex_rel, {}).get("edge_density", None)
+                    if ex_ed is not None:
+                        if abs(ex_ed - rf_ed) > prefilter_edge:
+                            ok = False
+                if ok:
+                    filtered.append(ex_rel)
+                else:
+                    # for stats
+                    if prefilter_aspect is not None and rf_ar is not None:
+                        ex_ar = aspect_ratio_of(ex_rel, "ex")
+                        if ex_ar is not None and abs(math.log(max(1e-6, ex_ar) / max(1e-6, rf_ar))) > prefilter_aspect:
+                            removed_by_aspect += 1
+                            continue  # don't double count
+                    if prefilter_edge is not None and rf_ed is not None:
+                        ex_ed = geom_ex.get(ex_rel, {}).get("edge_density", None)
+                        if ex_ed is not None and abs(ex_ed - rf_ed) > prefilter_edge:
+                            removed_by_edge += 1
+            cand_rels = filtered
 
         # Stage-2: histogram filter
         cand_list: List[Candidate] = []
@@ -458,8 +598,7 @@ def build_candidates(ex_paths: Dict[str, VariantPaths],
                 cand_list.append(Candidate(ex_rel, pd, hd))
 
         # If not enough after hist filter, fill with best by hist (even if > threshold)
-        if len(cand_list) < min_cand_per_basis:
-            # compute hd for all and take top by hist then phash
+        if len(cand_list) < min_cand_per_basis and cand_rels:
             tmp: List[Candidate] = []
             for ex_rel in cand_rels:
                 ex_hist = hist_ex.get(ex_rel)
@@ -475,11 +614,28 @@ def build_candidates(ex_paths: Dict[str, VariantPaths],
         # sort final by (hist, phash)
         cand_list.sort(key=lambda c: (c.hist_dist, c.phash_dist))
         out[key] = cand_list
+        cand_counts.append(len(cand_list))
 
         if i % 50 == 0 or i == len(ref_list):
             print(f"[INFO] Candidates progress: {i}/{len(ref_list)}")
 
-    return out
+    stats = {
+        "reference_total": len(ref_paths),
+        "extracted_total": len(ex_paths),
+        "cand_per_ref": {
+            "mean": float(np.mean(cand_counts)) if cand_counts else 0.0,
+            "median": float(np.median(cand_counts)) if cand_counts else 0.0,
+            "min": int(min(cand_counts)) if cand_counts else 0,
+            "max": int(max(cand_counts)) if cand_counts else 0,
+            "p10": float(np.percentile(cand_counts, 10)) if cand_counts else 0.0,
+            "p90": float(np.percentile(cand_counts, 90)) if cand_counts else 0.0,
+        },
+        "prefilter_removed": {
+            "aspect": int(removed_by_aspect),
+            "edge": int(removed_by_edge),
+        }
+    }
+    return out, stats
 
 
 # =========================
@@ -488,10 +644,10 @@ def build_candidates(ex_paths: Dict[str, VariantPaths],
 
 def parse_args():
     ap = argparse.ArgumentParser(
-        description="Generate candidates.json using pHash (BK-tree) + HSV Bhattacharyya filtering."
+        description="Generate candidates.json using pHash (BK-tree) + HSV Bhattacharyya filtering (+ optional cheap prefilters)."
     )
-    ap.add_argument("extracted_out", help="02_preprocess.py에서 생성한 추출 이미지 출력 루트")
-    ap.add_argument("reference_out", help="02_preprocess.py에서 생성한 원본 이미지 출력 루트")
+    ap.add_argument("extracted_out", help="02_preprocess.py에서 생성한 추출 이미지 출력 루트 (사용되지 않지만 호환성 유지용)")
+    ap.add_argument("reference_out", help="02_preprocess.py에서 생성한 원본 이미지 출력 루트 (사용되지 않지만 호환성 유지용)")
 
     ap.add_argument("--mapping", default="preprocess_mapping.json", help="전처리 매핑 JSON 경로")
     ap.add_argument("--out", default="candidates.json", help="결과 candidates.json 경로")
@@ -504,12 +660,18 @@ def parse_args():
     ap.add_argument("--bins-s", type=int, default=8)
     ap.add_argument("--bins-v", type=int, default=8)
 
-    # Thresholding / candidate count
-    ap.add_argument("--phash-threshold", type=int, default=36, help="pHash 햄밍 반경 초기값")
+    # Thresholding / candidate count (more conservative defaults)
+    ap.add_argument("--phash-threshold", type=int, default=28, help="pHash 햄밍 반경 초기값")
     ap.add_argument("--phash-step", type=int, default=2, help="K 미만일 때 반경 증가량")
-    ap.add_argument("--phash-max", type=int, default=48, help="반경 상한")
-    ap.add_argument("--hist-threshold", type=float, default=0.75, help="Bhattacharyya 거리 임계(작을수록 유사)")
-    ap.add_argument("--min-cand-per-basis", type=int, default=8, help="기준 이미지당 최소 후보 수 보장")
+    ap.add_argument("--phash-max", type=int, default=36, help="반경 상한")
+    ap.add_argument("--hist-threshold", type=float, default=0.70, help="Bhattacharyya 거리 임계(작을수록 유사)")
+    ap.add_argument("--min-cand-per-basis", type=int, default=5, help="기준 이미지당 최소 후보 수 보장")
+
+    # Cheap prefilters (None=disabled)
+    ap.add_argument("--prefilter-aspect", type=float, default=0.50,
+                    help="허용하는 로그 종횡비 차 절대값 임계 (|log(ar_ex/ar_ref)| ≤ T). 예: 0.5≈±65% (비활성화하려면 음수)")
+    ap.add_argument("--prefilter-edge", type=float, default=0.30,
+                    help="허용하는 에지밀도 차 절대값 임계 (|edge_ex - edge_ref| ≤ T). 비활성화하려면 음수")
 
     ap.add_argument("--verify", action="store_true", help="전처리 산출물(4콤보) 무결성 검사만 실행")
 
@@ -552,33 +714,49 @@ def main() -> int:
     )
     print(f"[INFO] reference: pHash={len(phash_ref)}, HSV={len(hist_ref)}")
 
+    # Geometry caches (edge density)
+    print("[INFO] 기하 캐시 구성 (edge density)...")
+    geom_ex = build_geom_cache(ex_paths, which="extracted", track="low", cache_dir=cache_dir, workers=args.workers)
+    geom_ref = build_geom_cache(ref_paths, which="reference", track="low", cache_dir=cache_dir, workers=args.workers)
+    print(f"[INFO] geom: extracted={len(geom_ex)}, reference={len(geom_ref)}")
+
+    # Prefilter thresholds (normalize: negative -> disabled)
+    pre_aspect = float(args.prefilter_aspect)
+    pre_edge   = float(args.prefilter_edge)
+    if pre_aspect < 0: pre_aspect = None
+    if pre_edge   < 0: pre_edge   = None
+
     # Build candidates
     print("[INFO] 후보 생성 시작...")
-    cand_map = build_candidates(
+    cand_map, cand_stats = build_candidates(
         ex_paths=ex_paths, ref_paths=ref_paths,
         phash_ex=phash_ex, phash_ref=phash_ref,
         hist_ex=hist_ex, hist_ref=hist_ref,
+        geom_ex=geom_ex, geom_ref=geom_ref,
+        mp_raw=mp,
         phash_threshold=args.phash_threshold,
         hist_threshold=args.hist_threshold,
         min_cand_per_basis=args.min_cand_per_basis,
-        phash_step=args.phash_step, phash_max=args.phash_max
+        phash_step=args.phash_step, phash_max=args.phash_max,
+        prefilter_aspect=pre_aspect, prefilter_edge=pre_edge
     )
 
     # Serialize
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_obj = {
-        "version": 1,
+        "version": 2,
         "basis": "reference",
         "track": "low",
         "features": {"phash_channel": "gray", "hist_channel": "color",
                      "bins_h": args.bins_h, "bins_s": args.bins_s, "bins_v": args.bins_v},
         "thresholds": {"phash": args.phash_threshold, "hist": args.hist_threshold},
         "min_cand_per_basis": args.min_cand_per_basis,
-        "stats": {
-            "reference_total": len(ref_paths),
-            "extracted_total": len(ex_paths),
+        "prefilter": {
+            "aspect_log_abs_max": pre_aspect,
+            "edge_density_abs_diff_max": pre_edge,
         },
+        "stats": cand_stats,
         "candidates": {
             k: [
                 {"extracted": c.extracted_rel, "phash_dist": c.phash_dist, "hist_dist": round(c.hist_dist, 6)}

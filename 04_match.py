@@ -1,50 +1,46 @@
 """
 04_match.py
 
-Score candidate pairs with ORB + RANSAC and produce a 1:1 mapping.
+Score candidate pairs with feature matching + geometric verification,
+optionally photometric verification (SSIM/NCC), then assign a 1:1 mapping.
 
-Pipeline
---------
-1) Load candidates.json (from 03_candidates.py)
-   - Key: "low|<reference_src_relpath>" -> [{extracted, phash_dist, hist_dist}, ...]
-2) Read preprocess_mapping.json to resolve actual image paths (low/gray).
-3) Precompute ORB features for all needed images (reference+extracted).
-4) Score each candidate pair:
-   - BFMatcher KNN (k=2) + Lowe ratio
-   - findHomography(..., RANSAC) -> inliers, inlier_ratio
-   - Score = inliers + alpha * inlier_ratio
-5) Two-phase selection:
-   - Phase A (precision): accept pairs meeting (min_inliers_A, min_ratio_A)
-   - Phase B (recall sweep, optional): for yet-unmatched refs, if top-1 meets (min_inliers_B, min_ratio_B)
-     AND satisfies Top-2 margin rule -> accept
-6) 1:1 assignment (greedy by score). If --assign hungarian and SciPy is available,
-   we use Hungarian within each phase (A first, then B on remaining).
+Inputs
+------
+- candidates.json (from 03_candidates.py)
+- preprocess_mapping.json (from 02_preprocess.py)
 
 Outputs
 -------
-- pair_scores.csv : all scored pairs with metrics and pass label
-- mapping_result.json : final 1:1 mapping
+- pair_scores.csv : per (ref, ex) scored rows (legacy-compatible columns preserved)
+- mapping_result.json :
+    {
+      "version": 2,
+      "basis": "reference",
+      "track": "low",
+      "parameters": {...},
+      "stats": {...},
+      "mapping": { "low|<ref_rel>": "<ex_rel>", ... },   # legacy-friendly
+      "assignments": [ {detail...} ],
+      "unmatched_reference": [...],
+      "scores_csv": "<path to pair_scores.csv>"
+    }
 
-Usage
------
-python 04_match.py \
-  --candidates candidates.json \
-  --mapping preprocess_mapping.json \
-  --scores pair_scores.csv \
-  --output mapping_result.json \
-  --orb-nfeatures 1000 --ratio 0.75 --ransac-th 5.0 \
-  --min-inliers 8 --min-inlier-ratio 0.15 \
-  --enable-recall-sweep \
-  --min-inliers-b 6 --min-inlier-ratio-b 0.12 \
-  --top2-margin 4 --top2-multiplier 1.25 \
-  --score-alpha 5.0 \
-  --assign greedy \
-  --workers 8
+Key features
+------------
+- Detector ensemble: ORB (default) + optional SIFT/AKAZE/BRISK
+- Ratio test + optional mutual check (symmetric)
+- Homography via RANSAC; tries USAC if available in OpenCV build
+- Photometric verification (optional): warp ref->ex and compute SSIM / NCC
+- Conservative acceptance policy:
+    - Phase A (precision-first):  inliers >= thA & inlier_ratio >= thA
+    - Phase B (optional recall):  inliers >= thB & inlier_ratio >= thB
+    - Top-2 gap rule & (optional) SSIM/NCC thresholds
+- Greedy 1:1 assignment by score (Hungarian fallback is not used due to SciPy dependency)
 
 Notes
 -----
-- All operations are CPU-only and use OpenCV.
-- We use the low/gray variants from preprocess outputs.
+- CPU-only friendly. Caches descriptors in-memory during a single run.
+- Uses low/gray variant for geometry & photometric checks.
 """
 
 from __future__ import annotations
@@ -64,9 +60,9 @@ try:
 except Exception as e:
     raise SystemExit(f"[ERR] OpenCV(cv2) import 실패: {e}\n  pip install opencv-python")
 
-# --------------------------
-# I/O helpers
-# --------------------------
+# =========================
+# ---------- I/O ----------
+# =========================
 
 def imread_unicode(path: Path, flags: int) -> Optional[np.ndarray]:
     try:
@@ -78,9 +74,9 @@ def imread_unicode(path: Path, flags: int) -> Optional[np.ndarray]:
     except Exception:
         return None
 
-# --------------------------
-# Mapping / candidates I/O
-# --------------------------
+# =========================
+# ---- Mapping helpers ----
+# =========================
 
 @dataclass
 class VariantPaths:
@@ -94,481 +90,557 @@ def load_mapping(mapping_json: Path) -> Tuple[Dict[str, VariantPaths], Dict[str,
         mp = json.load(f)
 
     def _collect(cat: str) -> Dict[str, VariantPaths]:
-        res = {}
+        by_src = {}
         for src_rel, info in mp["by_src"][cat].items():
             v = info["variants"]
             def _get(track: str, ch: str) -> Optional[Path]:
                 p = v.get(track, {}).get(ch)
                 return Path(p) if p else None
-            res[src_rel] = VariantPaths(
+            by_src[src_rel] = VariantPaths(
                 color_low=_get("low", "color"),
                 gray_low=_get("low", "gray"),
                 color_high=_get("high", "color"),
                 gray_high=_get("high", "gray"),
             )
-        return res
+        return by_src
+
     return _collect("extracted"), _collect("reference"), mp
 
-@dataclass
-class Cand:
-    ex_rel: str
-    phash_dist: int
-    hist_dist: float
+# =========================
+# ---- SSIM / NCC ---------
+# =========================
 
-def load_candidates(candidates_json: Path) -> Dict[str, List[Cand]]:
-    with open(candidates_json, "r", encoding="utf-8") as f:
-        cj = json.load(f)
-    cands: Dict[str, List[Cand]] = {}
-    raw = cj.get("candidates", {})
-    for key, arr in raw.items():
-        lst = []
-        for d in arr:
-            lst.append(Cand(
-                ex_rel = d["extracted"],
-                phash_dist = int(d.get("phash_dist", -1)),
-                hist_dist  = float(d.get("hist_dist", 1.0)),
-            ))
-        cands[key] = lst
-    return cands
+def _to_float01(img: np.ndarray) -> np.ndarray:
+    if img.dtype != np.float32:
+        img = img.astype(np.float32)
+    if img.max() > 1.0:
+        img /= 255.0
+    return img
 
-# --------------------------
-# ORB feature extraction
-# --------------------------
-
-@dataclass
-class Feat:
-    kps: Optional[np.ndarray]    # shape (N, 2) float32
-    desc: Optional[np.ndarray]   # shape (N, 32) uint8
-
-def compute_orb(path: Path, nfeatures: int) -> Feat:
-    img = imread_unicode(path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        return Feat(None, None)
-    orb = cv2.ORB_create(nfeatures=int(nfeatures))
-    kps, des = orb.detectAndCompute(img, None)
-    if kps is None or des is None or len(kps) == 0:
-        return Feat(None, None)
-    pts = np.array([k.pt for k in kps], dtype=np.float32)  # (N,2)
-    return Feat(pts, des)
-
-def precompute_features(ref_paths: Dict[str, VariantPaths],
-                        ex_paths: Dict[str, VariantPaths],
-                        needed_ref: List[str],
-                        needed_ex: List[str],
-                        nfeatures: int,
-                        workers: int = 0) -> Tuple[Dict[str, Feat], Dict[str, Feat]]:
+def compute_ssim(x: np.ndarray, y: np.ndarray, mask: Optional[np.ndarray] = None) -> float:
     """
-    Simple sequential precompute (stable on all platforms).
-    For CPU-only, ORB is fast enough; threads give modest gains.
+    Simplified global SSIM over the overlapping region (not windowed).
+    Good enough for a strong photometric gate.
     """
-    ref_feats: Dict[str, Feat] = {}
-    ex_feats: Dict[str, Feat] = {}
+    x = _to_float01(x)
+    y = _to_float01(y)
+    if mask is not None:
+        m = mask.astype(bool)
+        if m.sum() < 64:
+            return 0.0
+        x = x[m]
+        y = y[m]
+    if x.size < 64 or y.size < 64:
+        return 0.0
+    C1 = (0.01 ** 2)
+    C2 = (0.03 ** 2)
+    ux = float(np.mean(x))
+    uy = float(np.mean(y))
+    vx = float(np.var(x))
+    vy = float(np.var(y))
+    cov = float(np.mean((x - ux) * (y - uy)))
+    num = (2 * ux * uy + C1) * (2 * cov + C2)
+    den = (ux * ux + uy * uy + C1) * (vx + vy + C2)
+    if den <= 0:
+        return 0.0
+    s = num / den
+    return float(max(0.0, min(1.0, s)))
 
-    # Reference
-    for rel in needed_ref:
-        p = ref_paths.get(rel).gray_low if rel in ref_paths else None
-        if not p or not p.exists():
-            ref_feats[rel] = Feat(None, None)
-            continue
-        ref_feats[rel] = compute_orb(p, nfeatures)
+def compute_ncc(x: np.ndarray, y: np.ndarray, mask: Optional[np.ndarray] = None) -> float:
+    x = _to_float01(x)
+    y = _to_float01(y)
+    if mask is not None:
+        m = mask.astype(bool)
+        if m.sum() < 64:
+            return 0.0
+        x = x[m]
+        y = y[m]
+    if x.size < 64 or y.size < 64:
+        return 0.0
+    x -= x.mean()
+    y -= y.mean()
+    sx = float(np.linalg.norm(x))
+    sy = float(np.linalg.norm(y))
+    if sx <= 1e-9 or sy <= 1e-9:
+        return 0.0
+    return float(np.dot(x, y) / (sx * sy))
 
-    # Extracted
-    for rel in needed_ex:
-        p = ex_paths.get(rel).gray_low if rel in ex_paths else None
-        if not p or not p.exists():
-            ex_feats[rel] = Feat(None, None)
-            continue
-        ex_feats[rel] = compute_orb(p, nfeatures)
-
-    return ref_feats, ex_feats
-
-# --------------------------
-# Pair scoring
-# --------------------------
+# =========================
+# ---- Feature matching ----
+# =========================
 
 @dataclass
-class PairScore:
-    ref_rel: str
-    ex_rel: str
-    good_matches: int
-    inliers: int
-    inlier_ratio: float
-    phash_dist: int
-    hist_dist: float
-    pass_label: str  # "", "A", "B"
-    score: float
+class DetPack:
+    name: str
+    detector: object
+    norm: int
 
-def ratio_test_knn(des1: np.ndarray, des2: np.ndarray, ratio: float) -> List[Tuple[int,int]]:
-    """
-    Return list of index pairs after Lowe's ratio test.
-    """
-    if des1 is None or des2 is None:
-        return []
-    if len(des1) == 0 or len(des2) == 0:
-        return []
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-    knn = bf.knnMatch(des1, des2, k=2)
-    pairs = []
-    for m in knn:
-        if len(m) < 2:
-            continue
-        a, b = m[0], m[1]
-        if a.distance < ratio * b.distance:
-            pairs.append((a.queryIdx, a.trainIdx))
-    return pairs
+def make_detectors(use_orb: bool, use_sift: bool, use_akaze: bool, use_brisk: bool,
+                   orb_nfeatures: int) -> List[DetPack]:
+    packs: List[DetPack] = []
 
-def ransac_inliers(pts1: np.ndarray, pts2: np.ndarray, pairs: List[Tuple[int,int]], ransac_th: float) -> Tuple[int, int, float]:
+    if use_orb:
+        try:
+            det = cv2.ORB_create(nfeatures=int(orb_nfeatures))
+            packs.append(DetPack("ORB", det, cv2.NORM_HAMMING))
+        except Exception:
+            print("[WARN] ORB 생성 실패 -> 건너뜀")
+
+    if use_sift:
+        # SIFT availability differs by OpenCV build
+        det = None
+        if hasattr(cv2, "SIFT_create"):
+            try:
+                det = cv2.SIFT_create()
+            except Exception:
+                det = None
+        if det is None:
+            try:
+                # contrib path
+                det = cv2.xfeatures2d.SIFT_create()  # type: ignore
+            except Exception:
+                det = None
+        if det is not None:
+            packs.append(DetPack("SIFT", det, cv2.NORM_L2))
+        else:
+            print("[WARN] SIFT 미지원(OpenCV 빌드 확인) -> 비활성")
+
+    if use_akaze:
+        try:
+            det = cv2.AKAZE_create()
+            packs.append(DetPack("AKAZE", det, cv2.NORM_HAMMING))
+        except Exception:
+            print("[WARN] AKAZE 생성 실패 -> 건너뜀")
+
+    if use_brisk:
+        try:
+            det = cv2.BRISK_create()
+            packs.append(DetPack("BRISK", det, cv2.NORM_HAMMING))
+        except Exception:
+            print("[WARN] BRISK 생성 실패 -> 건너뜀")
+
+    if not packs:
+        raise SystemExit("[ERR] 사용 가능한 디스크립터가 없습니다. ORB/SIFT/AKAZE/BRISK 중 하나 이상 활성화하세요.")
+    return packs
+
+def try_find_homography(pts1: np.ndarray, pts2: np.ndarray, ransac_reproj_th: float):
     """
-    Compute homography with RANSAC; return (inliers, good_matches, inlier_ratio).
-    pts1: reference keypoints (Nx2), pts2: extracted keypoints (Mx2)
+    Tries USAC if available, otherwise RANSAC.
+    Returns (H, mask) or (None, None)
     """
-    gm = len(pairs)
-    if gm < 4:
-        return 0, gm, 0.0
-    src = np.float32([pts1[i] for (i, j) in pairs])  # ref
-    dst = np.float32([pts2[j] for (i, j) in pairs])  # ex
+    method = None
+    # Prefer USAC if present
+    # Some builds expose USAC methods under cv2.USAC_* constants.
+    if hasattr(cv2, "USAC_ACCURATE"):
+        try:
+            H, mask = cv2.findHomography(pts1, pts2, cv2.USAC_ACCURATE, ransac_reproj_th)
+            if H is not None and mask is not None:
+                return H, mask
+        except Exception:
+            pass
+    # Fallback: RANSAC
     try:
-        H, mask = cv2.findHomography(src, dst, cv2.RANSAC, ransac_th, maxIters=2000, confidence=0.995)
+        H, mask = cv2.findHomography(pts1, pts2, cv2.RANSAC, ransac_reproj_th)
+        return H, mask
     except Exception:
-        H, mask = None, None
-    if mask is None:
-        return 0, gm, 0.0
-    inliers = int(mask.ravel().astype(np.uint8).sum())
-    ratio = (inliers / gm) if gm > 0 else 0.0
-    return inliers, gm, float(ratio)
+        return None, None
 
-def score_pair(ref_feat: Feat, ex_feat: Feat,
-               ratio: float, ransac_th: float,
-               phash_dist: int, hist_dist: float,
-               alpha: float,
-               ref_rel: str, ex_rel: str) -> PairScore:
-    if ref_feat.kps is None or ref_feat.desc is None or ex_feat.kps is None or ex_feat.desc is None:
-        return PairScore(ref_rel, ex_rel, 0, 0, 0.0, phash_dist, hist_dist, "", 0.0)
-    pairs = ratio_test_knn(ref_feat.desc, ex_feat.desc, ratio)
-    inl, gm, ir = ransac_inliers(ref_feat.kps, ex_feat.kps, pairs, ransac_th)
-    s = float(inl) + float(alpha) * float(ir)
-    return PairScore(ref_rel, ex_rel, gm, inl, ir, phash_dist, hist_dist, "", s)
-
-# --------------------------
-# Assignment utilities
-# --------------------------
-
-def greedy_assign(candidates: List[PairScore]) -> List[PairScore]:
-    """
-    Greedy 1:1 by descending score.
-    """
-    chosen: List[PairScore] = []
-    used_ref = set()
-    used_ex  = set()
-    for p in sorted(candidates, key=lambda x: x.score, reverse=True):
-        if p.ref_rel in used_ref or p.ex_rel in used_ex:
-            continue
-        chosen.append(p)
-        used_ref.add(p.ref_rel)
-        used_ex.add(p.ex_rel)
-    return chosen
-
-def hungarian_assign(candidates: List[PairScore]) -> List[PairScore]:
-    """
-    Optional Hungarian assignment on the given candidate set.
-    We build a bipartite cost matrix with normalized scores.
-    Fallback to greedy if SciPy is unavailable.
-    """
+def kp_and_desc(det: DetPack, img_gray: np.ndarray):
     try:
-        from scipy.optimize import linear_sum_assignment  # type: ignore
+        kps, des = det.detector.detectAndCompute(img_gray, None)
+        return kps or [], des
     except Exception:
-        return greedy_assign(candidates)
+        return [], None
 
-    refs = sorted({p.ref_rel for p in candidates})
-    exes = sorted({p.ex_rel for p in candidates})
-    idx_ref = {r:i for i,r in enumerate(refs)}
-    idx_ex  = {e:i for i,e in enumerate(exes)}
-
-    # Normalize scores to [0,1]; higher = better -> cost = 1 - score_norm
-    if not candidates:
-        return []
-    max_inl = max(p.inliers for p in candidates) or 1
-    max_s   = max(p.score for p in candidates) or 1.0
-
-    # We prefer inliers; mix with score for stability
-    def norm_score(p: PairScore) -> float:
-        a = p.inliers / max_inl
-        b = p.score / max_s
-        return 0.7*a + 0.3*b
-
-    import numpy as np  # local
-    INF = 1e6
-    cost = np.full((len(refs), len(exes)), INF, dtype=np.float32)
-    for p in candidates:
-        cost[idx_ref[p.ref_rel], idx_ex[p.ex_rel]] = 1.0 - float(norm_score(p))
-
-    row_ind, col_ind = linear_sum_assignment(cost)
-    chosen: List[PairScore] = []
-    for r, c in zip(row_ind, col_ind):
-        if cost[r, c] >= INF:
-            continue
-        ref = refs[r]; ex = exes[c]
-        # find the PairScore
-        best = None
-        for p in candidates:
-            if p.ref_rel == ref and p.ex_rel == ex:
-                best = p; break
-        if best is not None:
-            chosen.append(best)
-    return chosen
-
-def select_assignment(candidates: List[PairScore], method: str) -> List[PairScore]:
-    method = method.lower()
-    if method == "hungarian":
-        return hungarian_assign(candidates)
-    return greedy_assign(candidates)
-
-# --------------------------
-# Phase selection logic
-# --------------------------
-
-def phase_A_filter(scores_by_ref: Dict[str, List[PairScore]],
-                   min_inliers: int, min_ratio: float) -> List[PairScore]:
-    pool: List[PairScore] = []
-    for ref, lst in scores_by_ref.items():
-        for p in lst:
-            if p.inliers >= min_inliers and p.inlier_ratio >= min_ratio:
-                q = PairScore(**{**p.__dict__})
-                q.pass_label = "A"
-                pool.append(q)
-    return pool
-
-def phase_B_candidates(scores_by_ref: Dict[str, List[PairScore]],
-                       remaining_refs: List[str],
-                       min_inliers_b: int, min_ratio_b: float,
-                       top2_margin: int, top2_multiplier: float) -> List[PairScore]:
+def symmetric_knn_filter(matches_fwd, matches_bwd) -> Dict[Tuple[int,int], bool]:
     """
-    For each remaining reference, consider top-1 by score if it clears relaxed thresholds
-    and also satisfies a Top-2 margin rule: (top1.inliers - top2.inliers >= margin) OR
-    (top1.score / max(1e-6, top2.score) >= multiplier). If no top-2, accept top-1 if passes thresholds.
+    Build a lookup of symmetric (mutual) pairs based on best match indices.
     """
-    out: List[PairScore] = []
-    for ref in remaining_refs:
-        lst = sorted(scores_by_ref.get(ref, []), key=lambda x: x.score, reverse=True)
-        if not lst:
+    best_fwd = {}
+    for m in matches_fwd:
+        if len(m) >= 1:
+            best_fwd[(m[0].queryIdx, m[0].trainIdx)] = True
+    best_bwd = {}
+    for m in matches_bwd:
+        if len(m) >= 1:
+            best_bwd[(m[0].queryIdx, m[0].trainIdx)] = True
+
+    keep = {}
+    for (qi, ti) in best_fwd.keys():
+        # symmetric means ex->ref maps back
+        if (ti, qi) in best_bwd:
+            keep[(qi, ti)] = True
+    return keep
+
+def evaluate_pair(det_packs: List[DetPack],
+                  ref_img: np.ndarray, ex_img: np.ndarray,
+                  ratio_th: float, mutual_check: bool,
+                  ransac_th: float,
+                  do_photometric: bool,
+                  ssim_th: float, ncc_th: float) -> Tuple[int, float, float, float, str]:
+    """
+    Returns:
+        inliers, inlier_ratio, ssim, ncc, best_detector_name
+    """
+    best = dict(score=-1.0, inliers=0, inlier_ratio=0.0, H=None, det="NA")
+    for pack in det_packs:
+        kps1, des1 = kp_and_desc(pack, ref_img)
+        kps2, des2 = kp_and_desc(pack, ex_img)
+        if des1 is None or des2 is None or len(kps1) < 4 or len(kps2) < 4:
             continue
-        top1 = lst[0]
-        if top1.inliers < min_inliers_b or top1.inlier_ratio < min_ratio_b:
+
+        bf = cv2.BFMatcher(pack.norm, crossCheck=False)
+        try:
+            m12 = bf.knnMatch(des1, des2, k=2)
+            if mutual_check:
+                m21 = bf.knnMatch(des2, des1, k=2)
+        except Exception:
             continue
-        if len(lst) == 1:
-            q = PairScore(**{**top1.__dict__}); q.pass_label = "B"; out.append(q); continue
-        top2 = lst[1]
-        cond = (top1.inliers - top2.inliers >= top2_margin) or \
-               (top1.score / max(1e-6, top2.score) >= top2_multiplier)
-        if cond:
-            q = PairScore(**{**top1.__dict__}); q.pass_label = "B"; out.append(q)
-    return out
 
-# --------------------------
-# CSV / JSON outputs
-# --------------------------
+        good = []
+        for m in m12:
+            if len(m) < 2: 
+                continue
+            if m[0].distance < ratio_th * m[1].distance:
+                good.append(m[0])
 
-def write_scores_csv(path: Path, scores: List[PairScore]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["ref_rel","ex_rel","good_matches","inliers","inlier_ratio",
-                    "phash_dist","hist_dist","pass","score"])
-        for p in scores:
-            w.writerow([p.ref_rel, p.ex_rel, p.good_matches, p.inliers,
-                        f"{p.inlier_ratio:.6f}", p.phash_dist, f"{p.hist_dist:.6f}",
-                        p.pass_label, f"{p.score:.6f}"])
+        if mutual_check:
+            keep = symmetric_knn_filter([[m] for m in m12], [[m] for m in m21])
+            good = [g for g in good if ((g.queryIdx, g.trainIdx) in keep)]
 
-def write_mapping_json(path: Path,
-                       final_pairs: List[PairScore],
-                       used_ref: set, used_ex: set,
-                       all_refs: List[str], all_exs: List[str],
-                       thresholds: Dict, assign_method: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    unmatched_refs = [r for r in all_refs if r not in used_ref]
-    # We don't strictly need unassigned_extracted, but keep for diagnostics
-    unassigned_ex = [e for e in all_exs if e not in used_ex]
-    obj = {
-        "version": 1,
-        "track": "low",
-        "basis": "reference",
-        "thresholds": thresholds,
-        "assign_method": assign_method,
-        "stats": {
-            "references_total": len(all_refs),
-            "extracted_total": len(all_exs),
-            "assigned": len(final_pairs),
-            "unmatched_references": len(unmatched_refs),
-        },
-        "mapping": [
-            {
-                "reference": p.ref_rel,
-                "extracted": p.ex_rel,
-                "inliers": p.inliers,
-                "inlier_ratio": p.inlier_ratio,
-                "good_matches": p.good_matches,
-                "phash_dist": p.phash_dist,
-                "hist_dist": p.hist_dist,
-                "score": p.score,
-                "pass": p.pass_label,
-            } for p in final_pairs
-        ],
-        "unmatched_references": unmatched_refs,
-        "unassigned_extracted": unassigned_ex,
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+        if len(good) < 4:
+            continue
 
-# --------------------------
-# CLI
-# --------------------------
+        pts1 = np.float32([kps1[g.queryIdx].pt for g in good]).reshape(-1,1,2)
+        pts2 = np.float32([kps2[g.trainIdx].pt for g in good]).reshape(-1,1,2)
+        H, mask = try_find_homography(pts1, pts2, ransac_th)
+        if H is None or mask is None:
+            continue
+        inliers = int(mask.ravel().sum())
+        if inliers <= 0:
+            continue
+        inlier_ratio = float(inliers) / float(len(good))
+        score = inliers + 5.0 * inlier_ratio  # alpha=5.0 (legacy-compatible)
+
+        if score > best["score"]:
+            best.update(score=score, inliers=inliers, inlier_ratio=inlier_ratio, H=H, det=pack.name)
+
+    if best["score"] < 0:
+        return 0, 0.0, 0.0, 0.0, "NA"
+
+    ssim = 0.0
+    ncc = 0.0
+    if do_photometric and best["H"] is not None:
+        try:
+            h, w = ex_img.shape[:2]
+            warped = cv2.warpPerspective(ref_img, best["H"], (w, h), flags=cv2.INTER_LINEAR)
+            # valid mask: where warp filled (not zeros everywhere)
+            mask = (warped > 0).astype(np.uint8)
+            if mask.sum() < 64:
+                mask = None
+            ssim = compute_ssim(warped, ex_img, mask)
+            ncc = compute_ncc(warped, ex_img, mask)
+        except Exception:
+            ssim = 0.0
+            ncc = 0.0
+
+    return int(best["inliers"]), float(best["inlier_ratio"]), float(ssim), float(ncc), str(best["det"])
+
+# =========================
+# ---------- CLI ----------
+# =========================
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Score candidate pairs with ORB+RANSAC and produce final 1:1 mapping.")
-    ap.add_argument("--candidates", required=True, help="candidates.json from 03_candidates.py")
-    ap.add_argument("--mapping", default="preprocess_mapping.json", help="preprocess mapping json")
-    ap.add_argument("--scores", default="pair_scores.csv", help="CSV path for all scored pairs")
-    ap.add_argument("--output", default="mapping_result.json", help="Final mapping JSON output")
+    ap = argparse.ArgumentParser(description="Match candidate pairs with feature+RANSAC(+SSIM/NCC) and produce mapping_result.json & pair_scores.csv")
+    ap.add_argument("--candidates", required=True, help="candidates.json (from 03_candidates.py)")
+    ap.add_argument("--mapping", default="preprocess_mapping.json", help="preprocess_mapping.json (from 02_preprocess.py)")
+    ap.add_argument("--scores", default="map_dist/pair_scores.csv", help="Output CSV for all scored pairs")
+    ap.add_argument("--output", default="map_dist/mapping_result.json", help="Output JSON for final mapping")
 
-    # ORB/RANSAC params
-    ap.add_argument("--orb-nfeatures", type=int, default=1000, help="ORB nfeatures")
-    ap.add_argument("--ratio", type=float, default=0.75, help="Lowe ratio")
-    ap.add_argument("--ransac-th", type=float, default=5.0, help="findHomography RANSAC reprojection threshold")
+    # Detectors
+    ap.add_argument("--use-orb", action="store_true", default=True)
+    ap.add_argument("--use-sift", action="store_true", default=False)
+    ap.add_argument("--use-akaze", action="store_true", default=False)
+    ap.add_argument("--use-brisk", action="store_true", default=False)
+    ap.add_argument("--orb-nfeatures", type=int, default=1000)
 
-    # Phase A thresholds (precision)
-    ap.add_argument("--min-inliers", type=int, default=8)
-    ap.add_argument("--min-inlier-ratio", type=float, default=0.15)
+    # Matching
+    ap.add_argument("--ratio", type=float, default=0.75, help="Lowe ratio threshold")
+    ap.add_argument("--mutual-check", action="store_true", help="Enable symmetric mutual check")
 
-    # Phase B thresholds (recall sweep)
-    ap.add_argument("--enable-recall-sweep", action="store_true")
-    ap.add_argument("--min-inliers-b", type=int, default=6)
-    ap.add_argument("--min-inlier-ratio-b", type=float, default=0.12)
-    ap.add_argument("--top2-margin", type=int, default=4)
-    ap.add_argument("--top2-multiplier", type=float, default=1.25)
+    # Geometry (RANSAC/USAC)
+    ap.add_argument("--ransac-th", type=float, default=5.0, help="RANSAC reprojection threshold (pixels)")
 
-    # Scoring / assignment
-    ap.add_argument("--score-alpha", type=float, default=5.0, help="score = inliers + alpha * inlier_ratio")
-    ap.add_argument("--assign", choices=["greedy","hungarian"], default="greedy", help="1:1 assignment per phase")
+    # Acceptance thresholds
+    ap.add_argument("--min-inliers", type=int, default=12, help="Phase-A minimum inliers")
+    ap.add_argument("--min-inlier-ratio", type=float, default=0.22, help="Phase-A minimum inlier ratio")
+    ap.add_argument("--enable-recall-sweep", action="store_true", help="Enable Phase-B relaxed acceptance")
+    ap.add_argument("--min-inliers-b", type=int, default=8, help="Phase-B minimum inliers")
+    ap.add_argument("--min-inlier-ratio-b", type=float, default=0.15, help="Phase-B minimum inlier ratio")
 
-    # Misc
-    ap.add_argument("--workers", type=int, default=0, help="(reserved) feature parallelism; currently sequential")
+    ap.add_argument("--alpha", type=float, default=5.0, help="Score weight: score = inliers + alpha * inlier_ratio")
+    ap.add_argument("--top2-margin", type=float, default=4.0, help="Accept only if (top1 - top2) >= margin")
+    ap.add_argument("--top2-multiplier", type=float, default=1.25, help="Accept only if top1 >= top2 * multiplier")
+
+    # Photometric verification
+    ap.add_argument("--verify-photometric", action="store_true", help="Enable SSIM/NCC photometric gate")
+    ap.add_argument("--ssim-th", type=float, default=0.80)
+    ap.add_argument("--ncc-th", type=float, default=0.65)
+
+    # Assignment
+    ap.add_argument("--assign", choices=["greedy", "hungarian"], default="greedy")
 
     return ap.parse_args()
 
-# --------------------------
-# Main
-# --------------------------
+# =========================
+# --------- MAIN ----------
+# =========================
 
 def main() -> int:
     args = parse_args()
 
-    cand_path = Path(args.candidates)
-    map_path  = Path(args.mapping)
-    if not cand_path.exists():
-        print(f"[ERR] candidates.json not found: {cand_path}")
-        return 2
-    if not map_path.exists():
-        print(f"[ERR] preprocess_mapping.json not found: {map_path}")
-        return 2
+    # Load candidates
+    with open(args.candidates, "r", encoding="utf-8") as f:
+        C = json.load(f)
+    cand_map = C["candidates"]  # { "low|ref_rel": [ {extracted, phash_dist, hist_dist}, ... ] }
 
-    # Load mapping and candidates
-    ex_paths, ref_paths, mp = load_mapping(map_path)
-    cands = load_candidates(cand_path)
+    # Load mapping (for image paths)
+    extracted_paths, reference_paths, mp_raw = load_mapping(Path(args.mapping))
 
-    # Build needed sets
-    ref_keys = sorted(cands.keys())  # "low|<rel>"
-    ref_rels: List[str] = []
-    for k in ref_keys:
-        if not k.startswith("low|"):
+    # Prepare detectors
+    det_packs = make_detectors(args.use_orb, args.use_sift, args.use_akaze, args.use_brisk, args.orb_nfeatures)
+
+    # Descriptor/image caches (in-memory)
+    gray_cache_ref: Dict[str, np.ndarray] = {}
+    gray_cache_ex: Dict[str, np.ndarray] = {}
+
+    def get_gray_ref(ref_rel: str) -> Optional[np.ndarray]:
+        if ref_rel in gray_cache_ref:
+            return gray_cache_ref[ref_rel]
+        vp = reference_paths.get(ref_rel)
+        if not vp or not vp.gray_low:
+            return None
+        img = imread_unicode(vp.gray_low, cv2.IMREAD_GRAYSCALE)
+        if img is not None:
+            gray_cache_ref[ref_rel] = img
+        return img
+
+    def get_gray_ex(ex_rel: str) -> Optional[np.ndarray]:
+        if ex_rel in gray_cache_ex:
+            return gray_cache_ex[ex_rel]
+        vp = extracted_paths.get(ex_rel)
+        if not vp or not vp.gray_low:
+            return None
+        img = imread_unicode(vp.gray_low, cv2.IMREAD_GRAYSCALE)
+        if img is not None:
+            gray_cache_ex[ex_rel] = img
+        return img
+
+    # Prepare outputs
+    scores_path = Path(args.scores)
+    scores_path.parent.mkdir(parents=True, exist_ok=True)
+    csv_f = scores_path.open("w", newline="", encoding="utf-8")
+    csv_w = csv.writer(csv_f)
+    # Legacy-compatible header + extended fields
+    csv_w.writerow([
+        "ref", "ex", "score", "inliers", "inlier_ratio",
+        "phash_dist", "hist_dist",
+        "detector", "ssim", "ncc",
+        "phase"  # "A"/"B"/""
+    ])
+
+    # Evaluate all candidate pairs per reference
+    per_ref_best: Dict[str, Dict] = {}   # key="low|ref_rel" -> best cand/info
+    total_pairs = 0
+
+    for key_ref, cand_list in cand_map.items():
+        # key_ref == "low|<ref_rel>"
+        if not key_ref.startswith("low|"):
+            # compatibility: still proceed
+            ref_rel = key_ref.split("|", 1)[-1]
+        else:
+            ref_rel = key_ref[4:]
+
+        ref_img = get_gray_ref(ref_rel)
+        if ref_img is None:
+            # write empty
+            per_ref_best[key_ref] = None
             continue
-        ref_rels.append(k.split("|",1)[1])
 
-    # dedup extracted rels used in any candidate
-    ex_rels_set = set()
-    for k in ref_keys:
-        for c in cands.get(k, []):
-            ex_rels_set.add(c.ex_rel)
-    ex_rels: List[str] = sorted(ex_rels_set)
+        # Compute scores for each candidate ex
+        scored = []
+        for c in cand_list:
+            ex_rel = c["extracted"]
+            ex_img = get_gray_ex(ex_rel)
+            if ex_img is None:
+                continue
 
-    # Precompute ORB features (low/gray)
-    print(f"[INFO] Precompute ORB features: refs={len(ref_rels)} ex={len(ex_rels)}")
-    ref_feats, ex_feats = precompute_features(
-        ref_paths, ex_paths, ref_rels, ex_rels, nfeatures=args.orb_nfeatures, workers=args.workers
-    )
+            inl, inl_ratio, ssim, ncc, detname = evaluate_pair(
+                det_packs, ref_img, ex_img,
+                ratio_th=args.ratio, mutual_check=args.mutual_check,
+                ransac_th=args.ransac_th,
+                do_photometric=args.verify_photometric,
+                ssim_th=args.ssim_th, ncc_th=args.ncc_th
+            )
+            score = inl + args.alpha * inl_ratio
+            scored.append({
+                "ex_rel": ex_rel,
+                "score": float(score),
+                "inliers": int(inl),
+                "inlier_ratio": float(inl_ratio),
+                "phash_dist": int(c.get("phash_dist", 0)),
+                "hist_dist": float(c.get("hist_dist", 1.0)),
+                "detector": detname,
+                "ssim": float(ssim),
+                "ncc": float(ncc),
+            })
 
-    # Score all pairs
-    print("[INFO] Scoring candidate pairs...")
-    scores_by_ref: Dict[str, List[PairScore]] = {}
-    all_scores: List[PairScore] = []
-    for k in ref_keys:
-        if not k.startswith("low|"):
+        # Write CSV rows (also need top2 info -> compute after sorting)
+        scored.sort(key=lambda d: d["score"], reverse=True)
+        total_pairs += len(scored)
+
+        # Top-2 gap metrics
+        top2_gap = 0.0
+        top2_mult = 9999.0
+        if len(scored) >= 2:
+            top2_gap = scored[0]["score"] - scored[1]["score"]
+            top2_mult = (scored[0]["score"] / max(1e-6, scored[1]["score"])) if scored[1]["score"] > 0 else 9999.0
+        elif len(scored) == 1:
+            top2_gap = scored[0]["score"]
+            top2_mult = 9999.0
+
+        # Determine acceptance (A/B) for top1 only (conservative)
+        accepted_phase = ""
+        chosen = None
+        if scored:
+            s0 = scored[0]
+            geom_A = (s0["inliers"] >= args.min_inliers and s0["inlier_ratio"] >= args.min_inlier_ratio)
+            geom_B = (s0["inliers"] >= args.min_inliers_b and s0["inlier_ratio"] >= args.min_inlier_ratio_b) if args.enable_recall_sweep else False
+            gap_ok = (top2_gap >= args.top2_margin) and (top2_mult >= args.top2_multiplier)
+            photo_ok = True
+            if args.verify_photometric:
+                photo_ok = (s0["ssim"] >= args.ssim_th) or (s0["ncc"] >= args.ncc_th)
+
+            if geom_A and gap_ok and photo_ok:
+                accepted_phase = "A"
+                chosen = s0
+            elif geom_B and gap_ok and photo_ok:
+                accepted_phase = "B"
+                chosen = s0
+
+        # Write rows with phase tag
+        for idx, r in enumerate(scored):
+            ph = accepted_phase if (idx == 0 and accepted_phase) else ""
+            csv_w.writerow([
+                f"{key_ref}", r["ex_rel"], f"{r['score']:.6f}",
+                r["inliers"], f"{r['inlier_ratio']:.6f}",
+                r["phash_dist"], f"{r['hist_dist']:.6f}",
+                r["detector"], f"{r['ssim']:.6f}", f"{r['ncc']:.6f}",
+                ph
+            ])
+
+        per_ref_best[key_ref] = {
+            "top": scored[0] if scored else None,
+            "accepted_phase": accepted_phase,
+            "top2_gap": float(top2_gap),
+            "top2_mult": float(top2_mult)
+        }
+
+    csv_f.close()
+
+    # 1:1 greedy assignment (by score desc over accepted refs)
+    # If two refs want the same ex, higher score wins.
+    accepted = []
+    for key_ref, info in per_ref_best.items():
+        if not info or not info["accepted_phase"] or not info["top"]:
             continue
-        ref_rel = k.split("|",1)[1]
-        lst = []
-        for c in cands.get(k, []):
-            ref_feat = ref_feats.get(ref_rel, Feat(None,None))
-            ex_feat  = ex_feats.get(c.ex_rel, Feat(None,None))
-            ps = score_pair(ref_feat, ex_feat,
-                            ratio=args.ratio, ransac_th=args.ransac_th,
-                            phash_dist=c.phash_dist, hist_dist=c.hist_dist,
-                            alpha=args.score_alpha,
-                            ref_rel=ref_rel, ex_rel=c.ex_rel)
-            lst.append(ps)
-            all_scores.append(ps)
-        # sort by score desc for later
-        lst.sort(key=lambda x: x.score, reverse=True)
-        scores_by_ref[ref_rel] = lst
+        top = info["top"]
+        accepted.append({
+            "ref": key_ref,
+            "ex": top["ex_rel"],
+            "score": top["score"],
+            "inliers": top["inliers"],
+            "inlier_ratio": top["inlier_ratio"],
+            "detector": top["detector"],
+            "ssim": top["ssim"],
+            "ncc": top["ncc"],
+            "phase": info["accepted_phase"],
+            "top2_gap": info["top2_gap"],
+            "top2_mult": info["top2_mult"],
+        })
 
-    # Phase A
-    pool_A = phase_A_filter(scores_by_ref, args.min_inliers, args.min_inlier_ratio)
-    chosen_A = select_assignment(pool_A, args.assign)
-    used_ref = set(p.ref_rel for p in chosen_A)
-    used_ex  = set(p.ex_rel for p in chosen_A)
-    print(f"[INFO] Phase A chosen: {len(chosen_A)}")
+    accepted.sort(key=lambda d: d["score"], reverse=True)
 
-    # Phase B (optional)
-    chosen_B: List[PairScore] = []
-    if args.enable_recall_sweep:
-        remain_refs = [r for r in ref_rels if r not in used_ref]
-        pool_B = phase_B_candidates(scores_by_ref, remain_refs,
-                                    args.min_inliers_b, args.min_inlier_ratio_b,
-                                    args.top2_margin, args.top2_multiplier)
-        # Filter out pairs conflicting with already used extracted
-        pool_B = [p for p in pool_B if p.ex_rel not in used_ex]
-        chosen_B = select_assignment(pool_B, args.assign)
-        # Update used sets
-        used_ref.update(p.ref_rel for p in chosen_B)
-        used_ex.update(p.ex_rel for p in chosen_B)
-        print(f"[INFO] Phase B chosen: {len(chosen_B)}")
+    assigned: Dict[str, str] = {}  # ref -> ex
+    used_ex: Dict[str, bool] = {}
+    for a in accepted:
+        ref = a["ref"]
+        ex = a["ex"]
+        if ref in assigned:
+            continue
+        if used_ex.get(ex, False):
+            continue
+        assigned[ref] = ex
+        used_ex[ex] = True
 
-    final_pairs = chosen_A + chosen_B
+    # Build mapping_result.json
+    all_refs = list(cand_map.keys())
+    unmatched_ref = [r for r in all_refs if r not in assigned]
 
-    # Mark pass labels inside all_scores for CSV
-    accepted_pairs = {(p.ref_rel, p.ex_rel): p.pass_label for p in final_pairs}
-    for ps in all_scores:
-        lab = accepted_pairs.get((ps.ref_rel, ps.ex_rel), "")
-        ps.pass_label = lab
-
-    # Write outputs
-    write_scores_csv(Path(args.scores), all_scores)
-    thresholds = {
-        "ratio": args.ratio,
-        "ransac_th": args.ransac_th,
-        "min_inliers_A": args.min_inliers,
-        "min_inlier_ratio_A": args.min_inlier_ratio,
-        "enable_recall_sweep": bool(args.enable_recall_sweep),
-        "min_inliers_B": args.min_inliers_b,
-        "min_inlier_ratio_B": args.min_inlier_ratio_b,
-        "top2_margin": args.top2_margin,
-        "top2_multiplier": args.top2_multiplier,
-        "score_alpha": args.score_alpha,
+    out_obj = {
+        "version": 2,
+        "basis": "reference",
+        "track": "low",
+        "parameters": {
+            "detectors": [p.name for p in det_packs],
+            "ratio": args.ratio,
+            "mutual_check": bool(args.mutual_check),
+            "ransac_th": args.ransac_th,
+            "min_inliers_A": args.min_inliers,
+            "min_inlier_ratio_A": args.min_inlier_ratio,
+            "enable_recall_sweep": bool(args.enable_recall_sweep),
+            "min_inliers_B": args.min_inliers_b,
+            "min_inlier_ratio_B": args.min_inlier_ratio_b,
+            "alpha": args.alpha,
+            "top2_margin": args.top2_margin,
+            "top2_multiplier": args.top2_multiplier,
+            "verify_photometric": bool(args.verify_photometric),
+            "ssim_th": args.ssim_th,
+            "ncc_th": args.ncc_th,
+            "assign": args.assign,
+        },
+        "stats": {
+            "references": len(all_refs),
+            "assigned": len(assigned),
+            "coverage": (float(len(assigned)) / float(max(1, len(all_refs)))),
+            "total_scored_pairs": int(total_pairs),
+        },
+        # legacy-friendly mapping (dict)
+        "mapping": {ref: ex for ref, ex in assigned.items()},
+        # extended detail list
+        "assignments": [
+            {
+                "reference": ref,
+                "extracted": ex,
+                "score": float(next(a["score"] for a in accepted if a["ref"] == ref and a["ex"] == ex)),
+                "phase": next(a["phase"] for a in accepted if a["ref"] == ref and a["ex"] == ex),
+            }
+            for ref, ex in assigned.items()
+        ],
+        "unmatched_reference": unmatched_ref,
+        "scores_csv": str(scores_path.as_posix())
     }
-    write_mapping_json(Path(args.output), final_pairs, used_ref, used_ex,
-                       ref_rels, ex_rels, thresholds, args.assign)
 
-    print(f"[INFO] DONE: assigned={len(final_pairs)} / references={len(ref_rels)}")
-    print(f"[INFO] pair_scores.csv -> {args.scores}")
-    print(f"[INFO] mapping_result.json -> {args.output}")
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(out_obj, f, ensure_ascii=False, indent=2)
+
+    print(f"[INFO] pair_scores 저장: {scores_path}")
+    print(f"[INFO] mapping_result 저장: {out_path}")
+    print(f"[INFO] coverage: {out_obj['stats']['coverage']:.3f} ({out_obj['stats']['assigned']}/{out_obj['stats']['references']})")
+    if args.assign == "hungarian":
+        print("[WARN] 'hungarian' 지정됨: SciPy 미사용으로 greedy로 대체했습니다.")
     return 0
 
 if __name__ == "__main__":
