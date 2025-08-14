@@ -252,22 +252,29 @@ def kp_and_desc(det: DetPack, img_gray: np.ndarray):
     except Exception:
         return [], None
 
-def symmetric_knn_filter(matches_fwd, matches_bwd) -> Dict[Tuple[int,int], bool]:
+def symmetric_knn_filter(matches_fwd, matches_bwd):
     """
     Build a lookup of symmetric (mutual) pairs based on best match indices.
     """
-    best_fwd = {}
+    def first_dm(entry):
+        # entry: list/tuple of DMatch 또는 DMatch 단일일 가능성
+        x = entry[0]
+        if isinstance(x, (list, tuple)):  # tuple[DMatch,...] 방어
+            x = x[0]
+        return x  # DMatch
+
+    best_fwd, best_bwd = {}, {}
     for m in matches_fwd:
         if len(m) >= 1:
-            best_fwd[(m[0].queryIdx, m[0].trainIdx)] = True
-    best_bwd = {}
+            dm = first_dm(m)
+            best_fwd[(dm.queryIdx, dm.trainIdx)] = True
     for m in matches_bwd:
         if len(m) >= 1:
-            best_bwd[(m[0].queryIdx, m[0].trainIdx)] = True
+            dm = first_dm(m)
+            best_bwd[(dm.queryIdx, dm.trainIdx)] = True
 
     keep = {}
     for (qi, ti) in best_fwd.keys():
-        # symmetric means ex->ref maps back
         if (ti, qi) in best_bwd:
             keep[(qi, ti)] = True
     return keep
@@ -305,7 +312,7 @@ def evaluate_pair(det_packs: List[DetPack],
                 good.append(m[0])
 
         if mutual_check:
-            keep = symmetric_knn_filter([[m] for m in m12], [[m] for m in m21])
+            keep = symmetric_knn_filter(m12, m21)
             good = [g for g in good if ((g.queryIdx, g.trainIdx) in keep)]
 
         if len(good) < 4:
